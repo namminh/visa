@@ -1,0 +1,45 @@
+Dưới đây là một dàn ý phỏng vấn cho vị trí yêu cầu các kỹ năng bạn nêu:
+1. Giỏi ngôn ngữ lập trình C
+•	Lập trình C thuần, hiểu sâu về cú pháp, bộ tiêu chuẩn ANSI C.
+•	Quản lý biến, con trỏ, con trỏ hàm.
+•	Xử lý bộ nhớ động (malloc, free), phòng tránh tràn bộ nhớ, memory leak.
+•	Biên dịch, liên kết, và tối ưu mã nguồn C.
+•	Khả năng debug bằng GDB hoặc printf.
+2. Cấu trúc dữ liệu, giải thuật, quản lý bộ nhớ
+•	Các kiểu cấu trúc dữ liệu: stack, queue, linked list, tree, hash table, graph,…
+•	Triển khai giải thuật tìm kiếm, sắp xếp (quick sort, merge sort, binary search…).
+•	Hiểu cách cấp phát bộ nhớ tĩnh/động, quản lý nhiều khối bộ nhớ đồng thời.
+•	Phân tích độ phức tạp thuật toán (Big O).
+3. Hệ thống tải lớn (high-load), ứng dụng đa luồng (multi-threaded)
+•	Khái niệm high-load, ví dụ làm việc với hàng ngàn kết nối/người dùng.
+•	Lập trình với multi-thread, multi-process (pthreads, fork, wait, join…).
+•	Đồng bộ tài nguyên: mutex, semaphore, spinlock, deadlock và giải quyết deadlock.
+•	Lập trình không đồng bộ/asynchronous IO.
+•	Công cụ profiling hiệu năng (valgrind, gprof, perf).
+4. Quản trị hệ điều hành UNIX cơ bản
+•	Các lệnh shell phổ biến: cd, ls, top, ps, grep, awk, sed, chmod, chown, crontab…
+•	Quản lý quy trình (process), service, file system.
+•	Hiểu về permission, user/group.
+•	Sử dụng ssh, scp, rsync để truy xuất/nén/quản lý file từ xa.
+5. Ứng dụng mạng với TCP/IP
+•	Mô hình OSI, TCP/IP.
+•	Lập trình socket cơ bản (server/client với C).
+•	Quản lý kết nối đồng thời nhiều client.
+•	Xử lý timeout, retry, nhận/ gửi dữ liệu lớn qua mạng.
+•	Hiểu về protocol (UDP, TCP), so sánh và ví dụ ứng dụng thực tế.
+6. Kinh nghiệm viết shell script
+•	Viết shell script để tự động hóa tác vụ (sao lưu, cronjob, kiểm tra log, quản lý tệp…).
+•	Hiểu về biến, vòng lặp, hàm, xử lý chuỗi trong bash.
+•	Thực hành: phân tích/cảnh báo log hệ thống, tự động build/deploy.
+7. SVN, Git
+•	Các thao tác cơ bản: clone, commit, push, pull, branch, merge, rebase, revert.
+•	Giải quyết xung đột (conflict), làm việc nhóm.
+•	So sánh khác biệt SVN và Git, khi nào nên dùng loại nào.
+8. SQL, Oracle Database, PostgreSQL (lợi thế)
+•	Biết cơ bản về kiến trúc cơ sở dữ liệu quan hệ.
+•	Truy vấn SQL select, insert, update, delete, join, index, view.
+•	Quản lý transaction, concurrency, tối ưu truy vấn.
+•	Khác biệt giữa Oracle và PostgreSQL, quản lý backup/restore.
+Nên chuẩn bị ví dụ thực tế, dự án bạn từng làm hoặc demo code cho từng ý để tăng tính thuyết phục khi phỏng vấn! Nếu muốn mẫu trả lời chi tiết từng phần, hãy nói rõ yêu cầu phần nào.
+
+

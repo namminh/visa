@@ -1,0 +1,7 @@
+[run_all] Logging full test run to: /mnt/f/mini-visa/logs/test-run-20250812-035522.log
+Starting server PORT=9090 THREADS=8 QUEUE_CAP=2048
+Starting server on port 9090 with DB_URI=postgresql://mini:mini@127.0.0.1:5432/mini_visa
+make: Entering directory '/mnt/f/mini-visa'
+./tests/run_all.sh: line 195: unexpected EOF while looking for matching `''
+cc -Wall -Wextra -O2 -g -pthread -L/usr/lib/x86_64-linux-gnu -o build/server build/config.o build/db.o build/handler.o build/log.o build/main.o build/metrics.o build/net.o build/threadpool.o -lpq
+make: Leaving directory '/mnt/f/mini-visa'

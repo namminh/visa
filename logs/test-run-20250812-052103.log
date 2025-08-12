@@ -1,0 +1,52 @@
+[1754976063.534729] $ echo '[run_all] Logging full test run to: /mnt/f/mini-visa/logs/test-run-20250812-052103.log'
+[run_all] Logging full test run to: /mnt/f/mini-visa/logs/test-run-20250812-052103.log
+[1754976063.534747] $ pass=0
+[1754976063.534752] $ fail=0
+[1754976063.534758] $ results=()
+[1754976063.534932] $ trap cleanup EXIT
+[1754976063.534949] $ make -C /mnt/f/mini-visa
+[1754976064.188910] $ start_server
+[1754976064.188964] $ log 'Starting server PORT=9090 THREADS=8 QUEUE_CAP=2048'
+[[1754976064.189242] $ ts
+[[1754976064.189274] $ date '+%Y-%m-%d %H:%M:%S'
+[1754976064.190119] $ echo '[2025-08-12 05:21:04] Starting server PORT=9090 THREADS=8 QUEUE_CAP=2048'
+[2025-08-12 05:21:04] Starting server PORT=9090 THREADS=8 QUEUE_CAP=2048
+[1754976064.190513] $ echo 17721
+[1754976064.190546] $ DB_URI=postgresql://mini:mini@127.0.0.1:5432/mini_visa
+[1754976064.190575] $ PORT=9090
+[1754976064.190579] $ THREADS=8
+[1754976064.190582] $ QUEUE_CAP=2048
+[1754976064.190584] $ /mnt/f/mini-visa/scripts/run.sh
+[1754976064.192260] $ probe_ready
+[1754976064.192312] $ local tries=40
+[1754976064.192324] $ ((  tries-- > 0  ))
+[1754976064.192556] $ printf 'GET /healthz\r\n'
+[1754976064.192692] $ nc -w 1 127.0.0.1 9090
+[1754976064.192858] $ grep -q '^OK'
+[1754976064.194636] $ return 0
+[1754976064.194681] $ [[ 1 == \1 ]]
+[1754976064.195155] $ echo 17726
+[1754976064.195208] $ tail -n +1 -f /mnt/f/mini-visa/server.err
+[[1754976064.197643] $ cat /mnt/f/mini-visa/.tail.pid
+Starting server on port 9090 with DB_URI=postgresql://mini:mini@127.0.0.1:5432/mini_visa
+make: Entering directory '/mnt/f/mini-visa'
+{"ts":"2025-08-12 05:21:04.194","lvl":"INFO","event":"healthz","status":"OK"}
+[1754976064.204146] $ TAIL_PID=17726
+[1754976064.204168] $ rm -f /mnt/f/mini-visa/.tail.pid
+./tests/run_all.sh: line 230: unexpected EOF while looking for matching `''
+[[1754976064.207300] $ cleanup
+[[1754976064.207320] $ [[ -n 17726 ]]
+[[1754976064.207325] $ kill 17726
+[[1754976064.207367] $ kill_server
+[[1754976064.207382] $ local pid
+[[[1754976064.208096] $ cat /mnt/f/mini-visa/server.pid
+[[1754976064.211833] $ pid=17721
+[[1754976064.211902] $ [[ -n 17721 ]]
+[[1754976064.211913] $ kill -0 17721
+[[1754976064.211934] $ kill 17721
+[[1754976064.211962] $ sleep 0.2
+cc -Wall -Wextra -O2 -g -pthread -L/usr/lib/x86_64-linux-gnu -o build/server build/config.o build/db.o build/handler.o build/log.o build/main.o build/metrics.o build/net.o build/threadpool.o -lpq
+[[1754976064.413263] $ kill -9 17721
+[[1754976064.413319] $ true
+[[1754976064.413329] $ rm -f /mnt/f/mini-visa/server.pid
+make: Leaving directory '/mnt/f/mini-visa'

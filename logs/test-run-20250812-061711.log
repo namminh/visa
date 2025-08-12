@@ -1,0 +1,10 @@
+[run_all] Logging full test run to: /mnt/f/mini-visa/logs/test-run-20250812-061711.log (mode=verbose)
+[2025-08-12 06:17:11] Starting server PORT=9090 THREADS=8 QUEUE_CAP=2048
+
+[2025-08-12 06:17:12] ---- M0: approved ----
+Starting server on port 9090 with DB_URI=postgresql://mini:mini@127.0.0.1:5432/mini_visa
+[2025-08-12 06:17:12] [M0 approved] Sending: {"pan":"4111111111111111","amount":"10.00"}
+make: Entering directory '/mnt/f/mini-visa'
+cc -Wall -Wextra -O2 -g -pthread -L/usr/lib/x86_64-linux-gnu -o build/server build/config.o build/db.o build/handler.o build/log.o build/main.o build/metrics.o build/net.o build/threadpool.o -lpq
+make: Leaving directory '/mnt/f/mini-visa'
+[2025-08-12 06:17:17] [M0 approved] Response: Sending to 127.0.0.1:9090 -> {"pan":"4111111111111111","amount":"10.00"}

@@ -1,0 +1,3 @@
+{"ts":"2025-08-12 06:17:12.003","lvl":"INFO","event":"healthz","status":"OK"}
+db_connect ok
+bind: Address already in use
