@@ -25,6 +25,10 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include "metrics.h"
+#include "iso8583.h"
+#include "risk.h"
+#include "ledger.h"
+#include "version.h"
 
 /*
  * Simple connection handler stub.
@@ -79,36 +83,7 @@ static void mask_pan(const char *pan, char *out, size_t outsz) {
     out[n] = '\0';
 }
 
-// Very naive JSON field extractor: finds "key":"value" or numeric value
-static int parse_field(const char *buf, const char *key, char *out, size_t outsz) {
-    char pattern[64];
-    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    const char *p = strstr(buf, pattern);
-    if (!p) return -1;
-    p = strchr(p + strlen(pattern), ':');
-    if (!p) return -1;
-    p++;
-    while (*p && isspace((unsigned char)*p)) p++;
-    if (*p == '"') {
-        p++;
-        const char *q = strchr(p, '"');
-        if (!q) return -1;
-        size_t len = (size_t)(q - p);
-        if (len >= outsz) len = outsz - 1;
-        memcpy(out, p, len);
-        out[len] = '\0';
-        return 0;
-    }
-    // number as plain text until delimiter
-    const char *q = p;
-    while (*q && *q != ',' && *q != '}' && !isspace((unsigned char)*q)) q++;
-    size_t len = (size_t)(q - p);
-    if (len == 0) return -1;
-    if (len >= outsz) len = outsz - 1;
-    memcpy(out, p, len);
-    out[len] = '\0';
-    return 0;
-}
+// Note: JSON field extraction moved to iso8583.c for normalization
 
 // Write the whole buffer, handling partial writes and EINTR
 static int write_all(int fd, const char *buf, size_t len) {
@@ -186,12 +161,23 @@ void handler_job(void *arg) {
             }
             if (strncmp(line, "GET /metrics", 12) == 0) {
                 unsigned long t=0,a=0,d=0,b=0; metrics_snapshot(&t,&a,&d,&b);
+                unsigned long rd = metrics_get_risk_declined();
                 char m[256];
                 int mlen = snprintf(m, sizeof(m),
-                                    "{\"total\":%lu,\"approved\":%lu,\"declined\":%lu,\"server_busy\":%lu}\n",
-                                    t,a,d,b);
+                                    "{\"total\":%lu,\"approved\":%lu,\"declined\":%lu,\"server_busy\":%lu,\"risk_declined\":%lu}\n",
+                                    t,a,d,b,rd);
                 if (mlen > 0 && (size_t)mlen < sizeof(m)) (void)write_all(fd, m, (size_t)mlen);
                 log_message_json("INFO", "metrics", NULL, "SNAPSHOT", -1);
+                start = nl + 1;
+                continue;
+            }
+            if (strncmp(line, "GET /version", 12) == 0) {
+                char body[128];
+                int n = snprintf(body, sizeof(body),
+                                 "{\"version\":\"%s\",\"schema\":%d}\n",
+                                 MINI_VISA_VERSION, MINI_VISA_SCHEMA_VERSION);
+                if (n > 0 && (size_t)n < sizeof(body)) (void)write_all(fd, body, (size_t)n);
+                log_message_json("INFO", "version", NULL, MINI_VISA_VERSION, -1);
                 start = nl + 1;
                 continue;
             }
@@ -199,28 +185,28 @@ void handler_job(void *arg) {
             // Process one JSON request in 'line'
             struct timeval t0, t1; gettimeofday(&t0, NULL);
             metrics_inc_total();
-            char pan[64] = {0}, amount[64] = {0};
-            char request_id[128] = {0};
-            if (parse_field(line, "pan", pan, sizeof(pan)) != 0 ||
-                parse_field(line, "amount", amount, sizeof(amount)) != 0) {
+            IsoRequest req;
+            char perr[64] = {0};
+            if (iso_parse_request_line(line, &req, perr, sizeof(perr)) != 0) {
                 const char *resp = "{\"status\":\"DECLINED\",\"reason\":\"bad_request\"}\n";
                 (void)write_all(fd, resp, strlen(resp));
                 metrics_inc_declined();
-                log_message_json("WARN", "tx", request_id, "DECLINED", -1);
+                log_message_json("WARN", "tx", NULL, "DECLINED", -1);
                 start = nl + 1;
                 continue;
             }
-            (void)parse_field(line, "request_id", request_id, sizeof(request_id));
+            const char *request_id = req.request_id;
 
-            if (!luhn_check(pan)) {
+            if (!luhn_check(req.pan)) {
                 const char *resp = "{\"status\":\"DECLINED\",\"reason\":\"luhn_failed\"}\n";
                 (void)write_all(fd, resp, strlen(resp));
                 metrics_inc_declined();
+                metrics_inc_risk_declined();
                 log_message_json("WARN", "tx", request_id, "DECLINED", -1);
                 start = nl + 1;
                 continue;
             }
-            double amt = atof(amount);
+            double amt = atof(req.amount_text);
             if (!(amt > 0.0) || amt > 10000.0) {
                 const char *resp = "{\"status\":\"DECLINED\",\"reason\":\"amount_invalid\"}\n";
                 (void)write_all(fd, resp, strlen(resp));
@@ -230,12 +216,26 @@ void handler_job(void *arg) {
                 continue;
             }
 
+            // Risk engine (stub): currently always allow; placeholder for future rules
+            RiskDecision rdec; risk_evaluate(&req, &rdec);
+            if (!rdec.allow) {
+                char body[128];
+                int n = snprintf(body, sizeof(body),
+                                 "{\"status\":\"DECLINED\",\"reason\":\"%s\"}\n",
+                                 rdec.reason[0] ? rdec.reason : "risk_decline");
+                if (n > 0 && (size_t)n < sizeof(body)) (void)write_all(fd, body, (size_t)n);
+                metrics_inc_declined();
+                log_message_json("WARN", "tx", request_id, "DECLINED", -1);
+                start = nl + 1;
+                continue;
+            }
+
             char masked[64];
-            mask_pan(pan, masked, sizeof(masked));
+            mask_pan(req.pan, masked, sizeof(masked));
             DBConnection *dbc = db_thread_get(ctx->db);
             int is_dup = 0;
             char db_status[32] = {0};
-            if (db_insert_or_get_by_reqid(dbc, request_id, masked, amount, "APPROVED", &is_dup, db_status, sizeof(db_status)) != 0) {
+            if (db_insert_or_get_by_reqid(dbc, request_id, masked, req.amount_text, "APPROVED", &is_dup, db_status, sizeof(db_status)) != 0) {
                 const char *resp = "{\"status\":\"DECLINED\",\"reason\":\"db_error\"}\n";
                 (void)write_all(fd, resp, strlen(resp));
                 metrics_inc_declined();
@@ -243,6 +243,8 @@ void handler_job(void *arg) {
                 start = nl + 1;
                 continue;
             }
+            // Ledger hold (stub)
+            (void)ledger_authorize_hold(&req);
             const char *ok_body = is_dup
                 ? "{\"status\":\"APPROVED\",\"idempotent\":true}\n"
                 : "{\"status\":\"APPROVED\"}\n";

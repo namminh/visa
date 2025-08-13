@@ -16,6 +16,9 @@
 #include "db.h"
 #include "log.h"
 #include "metrics.h"
+#include "risk.h"
+#include "ledger.h"
+#include "clearing.h"
 #include <stdio.h>
 
 int main(int argc, char *argv[]) {
@@ -25,6 +28,9 @@ int main(int argc, char *argv[]) {
     }
     log_init();
     metrics_init();
+    risk_init();
+    ledger_init();
+    clearing_init();
     // Kết nối cơ sở dữ liệu (sẽ dùng làm bootstrap cho per-thread DB)
     DBConnection *dbc = db_connect(cfg.db_uri);
     if (!dbc) {

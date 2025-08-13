@@ -87,13 +87,13 @@ int net_server_run(const Config *cfg, ThreadPool *pool, DBConnection *dbc) {
         ctx->db = dbc;
 
         // Submit to thread pool; if queue is full, send a friendly error and drop
-        if (threadpool_submit(pool, handler_job, ctx) != 0) {
-            const char *busy = "{\"status\":\"DECLINED\",\"reason\":\"server_busy\"}\n";
-            (void)send(fd, busy, strlen(busy), 0);
-            metrics_inc_server_busy();
-            close(fd);
-            free(ctx);
-        }
+            if (threadpool_submit(pool, handler_job, ctx) != 0) {
+                const char *busy = "{\"status\":\"DECLINED\",\"reason\":\"server_busy\"}\n";
+                (void)send(fd, busy, strlen(busy), 0);
+                metrics_inc_server_busy();
+                close(fd);
+                free(ctx);
+            }
     }
 
     close(listen_fd);

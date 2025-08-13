@@ -284,3 +284,108 @@ Mục tiêu: nâng cấp mini‑Visa thành dịch vụ có khả năng chịu l
 - Pha 2: Online migration + blue/green + `/version`; bổ sung runbook và canary.
 - Pha 3: Active‑passive multi‑region + failover script + outbox; kiểm thử hỗn loạn.
 - Pha 4 (stretch): Active‑active hash‑routing idempotency; reconcile outbox hai chiều.
+
+## 18) Nâng cấp mức VISA “thật” (domain, giao thức, nghiệp vụ)
+
+Mục tiêu: từng bước biến mini‑Visa thành mô phỏng có độ phức tạp gần hệ thống thẻ thật (authorization/clearing/settlement/dispute), vẫn có thể tự triển khai và kiểm thử trên máy cá nhân bằng cơ chế mô phỏng an toàn (không chạm dữ liệu nhạy cảm thật).
+
+### 18.1 Phân hệ và ranh giới dịch vụ
+- Gateway & Translator: nhận TCP/HTTP, chuyển đổi JSON ↔ ISO 8583 (stub), quản lý phiên và framing.
+- Authorization Service: quyết định APPROVED/DECLINED, quản lý idempotency, retry/breaker, rule rủi ro thời gian thực.
+- Risk Engine: rule‑based + stub ML; velocity, blacklist, geo/IP, device fingerprint (giả lập).
+- Tokenization & PAN Vault: sinh token thay PAN, lưu PAN mã hoá/masking (mô phỏng, không PAN thật).
+- Ledger & Accounting: sổ cái bút toán kép; tài khoản merchant/issuer/fees; đảm bảo cân bằng.
+- Clearing & Settlement: nhận file/batch clearing (giả lập), tính phí interchange/network, tạo bút toán settlement T+1.
+- Reconciliation: so khớp giao dịch giữa auth, ledger, clearing; phát hiện lệch.
+- Dispute/Chargeback: quản lý vòng đời tranh chấp, evidence, representment, arbitration (stub trạng thái và SLA).
+- Key Management/HSM: quản lý khoá, DUKPT/ZMK/ZPK (chỉ mô phỏng interface, không triển khai crypto thật).
+- Observability & Compliance: metrics, tracing, audit log, retention và redaction.
+
+### 18.2 Giao thức ISO 8583 (mô phỏng tối thiểu)
+- MTI phổ biến: 0100 (Authorization Request), 0110 (Response), 0200/0210 (Financial), 0420/0430 (Reversal), 0220 (Advice).
+- Data Elements trọng yếu (mapping sang JSON):
+  - DE2 PAN → `pan` (chỉ dùng để mask/token hoá; hạn chế lưu trữ).
+  - DE3 Processing Code → `type` (AUTH/CAPTURE/REFUND/REVERSAL giả lập).
+  - DE4 Amount → `amount` + `currency`.
+  - DE7 Transmission Date/Time → `ts`.
+  - DE11 STAN → `request_id` (idempotency key).
+  - DE14 Expiry → `exp` (tuỳ chọn kiểm tra định dạng, không lưu thô).
+  - DE22 POS Entry Mode, DE41 Terminal ID, DE42 Merchant ID → `device`, `merchant_id`.
+  - DE39 Response Code → `status`/`reason`.
+  - DE55 EMV data (ARQC/ARPC) → trường nhị phân, chỉ mô phỏng hợp lệ/hỏng.
+- Translator: tạo lớp `iso8583_adapter` để (de)serialize cấu trúc sang JSON nội bộ. Bắt đầu từ subset trường; thêm dần theo nhu cầu test.
+
+### 18.3 Authorization “thật” (dòng xử lý bên trong)
+- Tiền xử lý: xác thực chữ ký/hmac header (stub), chống replay theo `ts` + cửa sổ thời gian, kiểm tra schema_version.
+- Kiểm soát rủi ro: rule tuyên bố rõ ràng (velocity by PAN/merchant, geo mismatch, blacklist BIN/PAN token, limit theo MCC).
+- Kiểm tra hạn mức/tín dụng: dùng Ledger account “available balance” (mô phỏng), lock soft cho AUTH; CAPTURE trừ cứng.
+- Quyết định: trả mã `DE39` hợp lệ (00 APPROVED, 05 Do not honor, 14 Invalid card, 51 Insufficient funds...). Map sang JSON `status/reason`.
+- Idempotency xuyên dịch vụ: `UNIQUE(tenant_id, idempotency_key)`; đọc lại kết quả cũ khi trùng; log `idempotent_hit`.
+- Stand‑in Processing (STIP) giả lập: khi Risk/Ledger/DB lỗi hoặc breaker mở → áp policy đơn giản (ví dụ decline‑by‑default hoặc approve dưới ngưỡng nhỏ) và đánh dấu `stand_in=true` trong log/metrics.
+
+### 18.4 Clearing & Settlement (dual‑message)
+- Clearing file (giả lập CSV/JSON) nhập vào hằng ngày: chứa các giao dịch đã được presentment/capture.
+- Tính phí: interchange, assessment, processing fee; cấu hình theo `card_type/MCC/region` (bảng cấu hình mô phỏng).
+- FX: chuyển đổi tiền tệ dùng tỷ giá snapshot (stub) và ghi chênh lệch.
+- Settlement T+1: tạo bút toán chuyển tiền net per merchant/issuer; sinh “vouchers” (stub) và log.
+- Reconciliation: so khớp số tiền giữa AUTH ↔ CLEARING ↔ LEDGER; tạo báo cáo lệch và công cụ điều tra.
+
+### 18.5 Ledger & Kế toán (bút toán kép)
+- Mô hình tài khoản: Merchant Payables, Scheme Fees, Interchange Fees, Issuer Receivables, Chargebacks, Reserves.
+- Bút toán:
+  - AUTH: ghi giữ chỗ (authorization hold) ngoài bảng chính; không vào sổ cái cứng.
+  - CAPTURE: Debit Cardholder/Issuer Receivable, Credit Merchant Payable; ghi phí.
+  - REFUND/REVERSAL: bút toán đảo chiều; giữ nguyên idempotency.
+- Bảo toàn bất biến: tổng Nợ = tổng Có; số dư không âm theo ràng buộc; kiểm thử property‑based.
+
+### 18.6 Dispute/Chargeback Lifecycle (stub)
+- Trạng thái: Open → Evidence Submitted → Representment → Pre‑Arbitration → Closed.
+- Tác nhân: Cardholder, Merchant, Acquirer, Issuer, Network.
+- SLA: mốc thời gian theo lý thuyết (giả lập); reminder jobs và escalation.
+- Lý do (reason codes): hàng mẫu (fraud, not received, defective, duplicate).
+
+### 18.7 Bảo mật & tuân thủ (PCI‑inspired, mô phỏng)
+- Giảm phạm vi PCI: tokenization ngay tại biên, PAN vault tách biệt, không ghi PAN đầy đủ.
+- Khoá & HSM: API mô phỏng cho DUKPT/ZMK/ZPK, ARQC/ARPC verification stub để không xử lý crypto thật.
+- 3‑D Secure (stub): thêm trường `threeds_result` (Frictionless/Challenge/Failed) tác động quyết định rủi ro.
+- PII/Privacy: data minimization, redaction trong log, TTL/retention theo loại dữ liệu.
+
+### 18.8 Risk/Fraud nâng cao (mô phỏng có số liệu)
+- Rules: velocity per PAN/merchant/IP, high‑risk MCC, BIN country ≠ IP country.
+- Model stub: logistic regression giả lập hoặc score ngẫu nhiên có seed; threshold điều chỉnh qua config.
+- Feedback loop: ghi outcome vào kho huấn luyện (stub); job đào tạo định kỳ (no‑op).
+
+### 18.9 Quan sát & SLO ở quy mô lớn
+- SLO: `availability ≥ 99.95%`, `p99 ≤ 120ms` ở 10k RPS cho auth; `clearing lag ≤ 5m` sau cutover.
+- Metrics mới: `stand_in_rate`, `risk_decline_rate`, `ledger_invariants_violations`, `clearing_ingest_lag`.
+- Tracing: span `gateway → auth → risk → ledger`; gán `trace_id` vào log ISO/JSON.
+
+### 18.10 Quản trị dữ liệu
+- Phân tầng dữ liệu: hot (auth), warm (30–90 ngày), cold (≥ 1 năm) với partitioning.
+- Masking/Token ở ETL/report; quyền xem dữ liệu chi tiết theo vai trò.
+- GDPR‑like: xoá dữ liệu theo yêu cầu (trên token/merchant scope, không PAN thật).
+
+### 18.11 Kiến trúc dịch vụ đề xuất (mono → module → micro)
+- Bước 1: trong 1 binary, tách module logic: `iso8583_adapter`, `auth`, `risk`, `ledger`, `clearing`.
+- Bước 2: tách process `risk` và `clearing` chạy nền (batch/worker), giao tiếp qua hàng đợi nội bộ (file/DB‑outbox).
+- Bước 3: cân nhắc dịch vụ hoá `gateway` và `auth` khi cần scale độc lập.
+
+### 18.12 Lộ trình nâng cấp theo pha (khả thi tự triển khai)
+- Pha A: ISO 8583 adapter (subset), map JSON↔ISO, thêm DE39 code; mở rộng metrics/tracing theo trace_id.
+- Pha B: Risk rules + stand‑in; cấu hình threshold, thêm `stand_in=true`, test breaker‑open→STIP.
+- Pha C: Ledger bút toán kép + invariant tests; AUTH hold → CAPTURE; REFUND/REVERSAL đường cơ bản.
+- Pha D: Clearing batch giả lập + fee + FX stub; job settlement T+1; báo cáo reconciliation lệch.
+- Pha E: Dispute workflow stub + dashboard SLA; hooks với ledger khi chargeback.
+- Pha F (advanced): Tokenization/PAN vault mock + 3DS stub + KMS/HSM API giả lập.
+
+### 18.13 Tiêu chí chấp nhận & demo
+- ISO 8583 round‑trip: gửi 0100 → 0110 qua adapter; response code đúng mapping.
+- Risk & STIP: khi DB/risk lỗi → stand‑in kick‑in; `stand_in_rate` > 0; log/tracing thể hiện tuyến.
+- Ledger invariants: test property đảm bảo Nợ=Có sau CAPTURE/REFUND/REVERSAL; số dư merchant không âm.
+- Clearing: ingest batch → sinh bút toán fee/FX; reconciliation không lệch hoặc báo cáo lệch chi tiết.
+- Dispute: mở tranh chấp → đổi trạng thái đúng SLA; ledger nhận chargeback.
+- Observability: dashboard p50/p95/p99, stand‑in, risk_decline, clearing_ingest_lag; alert hoạt động.
+
+### 18.14 Ghi chú an toàn
+- Không dùng PAN thật, không triển khai crypto sản xuất; mọi crypto/HSM chỉ ở mức interface mô phỏng.
+- Tài liệu chỉ nhằm học tập; khi đưa vào sản xuất thật cần đội PCI, bảo mật, tuân thủ và quy trình chứng nhận riêng.
