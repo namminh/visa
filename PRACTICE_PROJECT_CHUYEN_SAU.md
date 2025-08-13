@@ -212,3 +212,75 @@ Tài liệu này mở rộng `PRACTICE_PROJECT_GIAI_THICH.md` theo chiều sâu:
 ---
 
 Tài liệu này nhằm giúp bạn có câu chuyện đầy đủ: “thiết kế vì sao”, “đo thế nào”, “xử lý khi hỏng ra sao”, và “nâng cấp gì tiếp theo”. Khi phỏng vấn, hãy dẫn chứng bằng số đo (RPS/p95/p99, reject_rate), log/matrics, và mô tả các quyết định (trade‑offs) có lý do.
+
+## 16) Case khó mức chuyên gia: Multi‑region, HA, RL, Zero‑downtime
+
+Mục tiêu: nâng cấp mini‑Visa thành dịch vụ có khả năng chịu lỗi cao, mở rộng đa vùng (multi‑region), giới hạn tốc độ theo tenant, và triển khai không downtime; vẫn giữ đơn giản ở mức có thể để tự triển khai.
+
+### 16.1 Bối cảnh và tiêu chí SLO
+- SLO: `p99_latency ≤ 120ms`, `availability ≥ 99.95%`, `error_rate ≤ 0.1%` ở tải 10k RPS.
+- Hai vùng độc lập (A/B), đường truyền chéo 8–20ms. Khi A hỏng: RTO ≤ 60s, RPO ≤ 1s.
+- Bảo toàn idempotency xuyên vùng, không double‑charge.
+
+### 16.2 Yêu cầu giao thức và dữ liệu
+- Yêu cầu payload thêm: `tenant_id`, `idempotency_key`, `ts`, `schema_version`.
+- Xác thực: HMAC (ví dụ `X‑Sig`) trên payload chuẩn hóa để chống sửa dữ liệu giữa đường (TLS vẫn khuyến nghị).
+- Idempotency table: `UNIQUE(tenant_id, idempotency_key)`; TTL dọn rác sau N ngày.
+- Rate limiting theo tenant: token‑bucket/sliding‑window, có burst và quota ngày.
+
+### 16.3 Kiến trúc đa vùng
+- Triển khai active‑passive (bắt đầu): PG primary ở A, replica ở B (async). App chạy cả A/B; B chỉ nhận readiness false với DB read‑only; khi failover, B promote.
+- Nâng cấp tùy chọn active‑active: hash `idempotency_key` → region “home”; request lệch vùng thì proxy sang home hoặc ghi local với outbox để reconcile.
+- Outbox pattern: giao dịch DB và sự kiện `approved/declined` được commit atomically; background dispatcher bảo đảm at‑least‑once tới hàng đợi (kafka/nats) – mô phỏng bằng file/queue nội bộ nếu thiếu MQ.
+
+### 16.4 Backpressure và bảo vệ đột biến
+- Load‑shedding: khi queue > α×cap hoặc p95 vượt ngưỡng, trả `server_busy` có `retry_after_ms` (ngẫu nhiên trong 50–150ms để chống herd).
+- Rate limiting nhiều tầng: per‑tenant, per‑IP (thô), và global circuit‑breaker theo error‑budget burn.
+
+### 16.5 Circuit breaker v2
+- Sử dụng cửa sổ trượt theo thời gian (ví dụ 10s) với số mẫu tối thiểu; mở khi `error_rate > X%` hoặc `consecutive_failures > N`.
+- Half‑open giới hạn đồng thời (ví dụ 5 request thử nghiệm); đóng khi tỷ lệ thành công > ngưỡng trong cửa sổ nhỏ.
+- Ghi `breaker_state`, `open_reason`, `open_until` vào metrics và log có cấu trúc.
+
+### 16.6 Migrations không downtime
+- Nguyên tắc Backward/Forward compatible: thêm cột → backfill → chạy dual‑read/dual‑write (nếu cần) → cắt cũ → xóa cột cũ.
+- Online index creation; chạy shadow reads để so sánh kết quả giữa lược đồ cũ/mới (sampling).
+- Triển khai blue/green hoặc canary theo phần trăm traffic; hỗ trợ `GET /version` và flag `schema_version` trong response để kiểm.
+
+### 16.7 Bảo mật & tuân thủ mở rộng
+- Giới hạn scope PCI: PAN chỉ đi qua process ngắn, zeroize buffer sau mask; không ghi đĩa không mã hóa.
+- Secret/KMS: nạp khóa HMAC, DSN qua env hoặc file được mount; xoay khóa theo lịch; hỗ trợ key‑id trong header.
+- TLS: offload qua reverse proxy hoặc tích hợp native; bật mTLS nội bộ giữa các service (tùy chọn nâng cao).
+
+### 16.8 Quan sát nâng cao
+- Tracing: header `traceparent` → ghi `trace_id, span_id` vào log và metrics; liên kết request ↔ truy vấn DB.
+- RED/USE: `requests, errors, duration` + `utilization, saturation, errors` cho threadpool/queue.
+- Log sampling động theo RPS; đảm bảo sự kiện hiếm (ERROR/WARN) luôn được ghi.
+
+### 16.9 PostgreSQL nâng cao
+- Partition theo thời gian (tháng/tuần) cho bảng giao dịch; index phù hợp hot‑path.
+- Statement timeout per txn; prepared statements; retry an toàn theo mã lỗi phân loại.
+- Logical replication để failover; script promote và reconfigure readonly/primary.
+
+### 16.10 Kiểm thử và hỗn loạn cấp chuyên gia
+- Tải nặng: ma trận `THREADS × QUEUE_CAP × RPS` đến 10k; thu `p50/p95/p99`, `reject_rate`, `breaker_events`.
+- Fault injection: kill Postgres, tăng `tc netem` delay/loss 5–10%, throttle IO; kiểm chứng RTO/RPO.
+- Consistency: gửi trùng `idempotency_key` qua 2 vùng cùng lúc; xác nhận đúng 1 bản ghi hiệu lực.
+- Migrations: chạy online migration khi có tải; so sánh dual‑read không lệch.
+
+### 16.11 Deliverables
+- Mã nguồn: rate limiting per‑tenant, breaker v2, outbox đơn giản, endpoint `/version`, mở rộng `/metrics`.
+- Script: `scripts/failover.sh`, `scripts/loadgen-matrix.sh`, `scripts/migrate-online.sh` (khung tối thiểu).
+- Tài liệu: runbook sự cố (DB down, breaker open), hướng dẫn release canary/rollback, sơ đồ kiến trúc.
+- Dashboard/alert: rule cho `server_busy`, `breaker_opened`, `error_budget_burn`, `replica_lag`.
+
+### 16.12 Tiêu chí chấp nhận
+- 10k RPS với `p99 ≤ 120ms` trong 10 phút, `error_rate ≤ 0.1%`, `reject_rate ≤ 3%` khi backpressure hoạt động.
+- Failover A→B trong ≤ 60s; không double‑charge với `idempotency_key` trùng.
+- Chạy 1 migration không downtime có theo dõi dual‑read/so sánh kết quả.
+
+## 17) Lộ trình thực thi đề xuất (phân pha)
+- Pha 1: RL per‑tenant + breaker v2 + metrics/tracing cơ bản; benchmark và điều chỉnh sizing.
+- Pha 2: Online migration + blue/green + `/version`; bổ sung runbook và canary.
+- Pha 3: Active‑passive multi‑region + failover script + outbox; kiểm thử hỗn loạn.
+- Pha 4 (stretch): Active‑active hash‑routing idempotency; reconcile outbox hai chiều.
