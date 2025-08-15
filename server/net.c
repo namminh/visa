@@ -1,14 +1,29 @@
-/*
- * Minimal TCP server loop with thread-pool dispatch.
+/* [ANCHOR:NET_OVERVIEW]
+ * Network Accept Loop — Visual Overview / Sơ đồ tổng quan (EN + VN)
+ *
+ *  socket/bind/listen(backlog=128)  →  accept(fd)
+ *                                        |
+ *                                        v
+ *                         build HandlerContext (fd, db)
+ *                                        |
+ *                                        v
+ *                submit to threadpool (handler_job)
+ *                      |                     |
+ *        queue full → fast-fail    queue ok → worker handles I/O
+ *             send {"server_busy"}           (newline framing, timeouts)
+ *             close(fd)
  *
  * EN:
- * - Create listening socket -> accept loop -> submit connection jobs to thread pool.
- * - If queue is full (backpressure), return a short JSON error then close.
+ * - Backpressure is enforced by the bounded queue in threadpool. When full,
+ *   the server fails fast with a short JSON and closes the connection.
+ * - The kernel listen backlog absorbs short bursts of TCP connect storms.
+ * - Extensible: SO_REUSEPORT (multi-acceptors), TCP_NODELAY, epoll, TLS.
  *
- * VN (Phỏng vấn):
- * - Một tiến trình accept duy nhất (đơn giản) + thread pool xử lý song song.
- * - Backpressure: giới hạn queue để bảo vệ hệ thống; khi đầy trả "server_busy".
- * - Có thể mở rộng: SO_REUSEPORT (nhiều acceptors), epoll, TLS, protocol framing.
+ * VN:
+ * - Chống quá tải nằm ở hàng đợi giới hạn của threadpool. Khi đầy, trả phản hồi
+ *   JSON ngắn "server_busy" rồi đóng kết nối (fail fast) thay vì để chờ lâu.
+ * - Backlog (listen) giúp hấp thụ các đợt kết nối dồn dập ở mức kernel.
+ * - Dễ mở rộng: SO_REUSEPORT (nhiều tiến trình accept), TCP_NODELAY, epoll, TLS.
  */
 #include "net.h"
 #include "config.h"
@@ -34,8 +49,12 @@
  * enqueue each client socket into the thread pool for handling. This
  * stub simply prints a message and returns immediately.
  */
+// Optional: enable TCP_NODELAY after accept to reduce latency of small writes
+// #define ENABLE_TCP_NODELAY 1
+
 int net_server_run(const Config *cfg, ThreadPool *pool, DBConnection *dbc) {
     (void)pool; // not used yet
+    // [ANCHOR:NET_SOCKET_SETUP] Tạo socket, cấu hình REUSEADDR (và gợi ý REUSEPORT)
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
         perror("socket");
@@ -43,7 +62,12 @@ int net_server_run(const Config *cfg, ThreadPool *pool, DBConnection *dbc) {
     }
 
     int opt = 1;
+    // EN: Allow quick restart after close
+    // VN: Cho phép khởi động lại nhanh sau khi đóng socket
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    // EN: Optional — distribute accept load across multiple processes
+    // VN: Tuỳ chọn — chia tải accept ở mức kernel cho nhiều tiến trình
+    // setsockopt(listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -65,7 +89,7 @@ int net_server_run(const Config *cfg, ThreadPool *pool, DBConnection *dbc) {
 
     fprintf(stderr, "Server listening on port %d\n", cfg->listen_port);
 
-    // Accept loop: one TCP connection == one request
+    // [ANCHOR:NET_ACCEPT_LOOP] Vòng accept: mỗi kết nối TCP tương ứng một request
     for (;;) {
         struct sockaddr_in cli;
         socklen_t clilen = sizeof(cli);
@@ -75,6 +99,14 @@ int net_server_run(const Config *cfg, ThreadPool *pool, DBConnection *dbc) {
             perror("accept");
             break;
         }
+
+#ifdef ENABLE_TCP_NODELAY
+        // [ANCHOR:NET_TCP_NODELAY_HINT]
+        // EN: Reduce latency for small responses on this connection
+        // VN: Giảm độ trễ cho gói phản hồi nhỏ trên kết nối này
+        int one = 1;
+        (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+#endif
 
         // Create per-connection context for the handler
         HandlerContext *ctx = (HandlerContext *)malloc(sizeof(*ctx));
@@ -86,8 +118,10 @@ int net_server_run(const Config *cfg, ThreadPool *pool, DBConnection *dbc) {
         ctx->client_fd = fd;
         ctx->db = dbc;
 
-        // Submit to thread pool; if queue is full, send a friendly error and drop
+        // EN: Submit to thread pool; if queue is full, send an error and drop
+        // VN: Đẩy vào threadpool; nếu hàng đợi đầy, trả "server_busy" rồi đóng
             if (threadpool_submit(pool, handler_job, ctx) != 0) {
+                // [ANCHOR:NET_FAST_FAIL_BUSY] Fast-fail khi backpressure (queue đầy)
                 const char *busy = "{\"status\":\"DECLINED\",\"reason\":\"server_busy\"}\n";
                 (void)send(fd, busy, strlen(busy), 0);
                 metrics_inc_server_busy();
@@ -96,6 +130,7 @@ int net_server_run(const Config *cfg, ThreadPool *pool, DBConnection *dbc) {
             }
     }
 
+    // [ANCHOR:NET_CLOSE_LISTENER] Đóng socket lắng nghe khi thoát vòng accept
     close(listen_fd);
     return 0;
 }

@@ -1,0 +1,63 @@
+name: CI (Dockerized)
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build test image
+        run: |
+          docker build -t mini-visa-ci:${GITHUB_SHA} .
+
+      - name: Create network and start Postgres
+        run: |
+          docker network create mini-visa-net || true
+          docker run -d --rm --name visa-pg --network mini-visa-net \
+            -e POSTGRES_USER=mini -e POSTGRES_PASSWORD=mini -e POSTGRES_DB=mini_visa \
+            postgres:16
+
+      - name: Wait for Postgres and init schema
+        run: |
+          # Wait until Postgres is ready on the docker network host 'visa-pg'
+          docker run --rm --network mini-visa-net postgres:16 \
+            bash -lc 'for i in {1..60}; do pg_isready -h visa-pg -U mini && exit 0 || sleep 1; done; exit 1'
+          # Apply schema (and seed if present) using mounted workspace
+          docker run --rm --network mini-visa-net -v "${GITHUB_WORKSPACE}:/work" -w /work postgres:16 \
+            bash -lc "psql 'postgresql://mini:mini@visa-pg:5432/mini_visa' -f db/schema.sql; \
+                      [ -f db/seed.sql ] && psql 'postgresql://mini:mini@visa-pg:5432/mini_visa' -f db/seed.sql || true"
+
+      - name: Run tests inside container
+        env:
+          DB_URI: postgresql://mini:mini@visa-pg:5432/mini_visa
+          PORT: 9090
+        run: |
+          docker run --rm --network mini-visa-net \
+            -e DB_URI="$DB_URI" -e PORT="$PORT" \
+            -v "${GITHUB_WORKSPACE}:/work" -w /work \
+            mini-visa-ci:${GITHUB_SHA} \
+            bash -lc './tests/run_all.sh'
+
+      - name: Upload artifacts (logs and binaries)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mini-visa-ci-${{ github.run_id }}
+          path: |
+            build/**
+            logs/**
+            server.err
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f visa-pg 2>/dev/null || true
+          docker network rm mini-visa-net 2>/dev/null || true

@@ -1,4 +1,4 @@
-/*
+/* [ANCHOR:HANDLER_OVERVIEW]
  * Connection handler: reads one request, validates, writes one response.
  *
  * Processing flow (single request per TCP connection):
@@ -85,6 +85,7 @@ static void mask_pan(const char *pan, char *out, size_t outsz) {
 
 // Note: JSON field extraction moved to iso8583.c for normalization
 
+// [ANCHOR:HANDLER_WRITE_ALL]
 // Write the whole buffer, handling partial writes and EINTR
 static int write_all(int fd, const char *buf, size_t len) {
     size_t off = 0;
@@ -105,14 +106,18 @@ void handler_job(void *arg) {
     HandlerContext *ctx = (HandlerContext *)arg;
     if (!ctx) return;
     int fd = ctx->client_fd;
+    // [ANCHOR:HANDLER_TIMEOUTS]
     // 1) Set simple read/write timeouts to avoid hanging forever (keep-alive friendly)
     struct timeval tv;
     tv.tv_sec = 5; tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    // [ANCHOR:HANDLER_BUFFER]
+    // VN: Bộ đệm đọc theo dòng (newline-delimited). 8192 là giới hạn để chống DoS dòng quá dài.
     char buf[8192];
     size_t used = 0;
 
+    // [ANCHOR:HANDLER_READ_LOOP]
     for (;;) {
         // Read more data
         ssize_t n = read(fd, buf + used, sizeof(buf) - 1 - used);
@@ -128,6 +133,7 @@ void handler_job(void *arg) {
         used += (size_t)n;
         buf[used] = '\0';
 
+        // [ANCHOR:HANDLER_FRAMING]
         // Process complete lines (newline-delimited framing)
         char *start = buf;
         for (;;) {
@@ -142,6 +148,7 @@ void handler_job(void *arg) {
                 continue;
             }
 
+            // [ANCHOR:HANDLER_HEALTH_READY_METRICS]
             // Health/Ready/Metrics simple GET handling per line
             if (strncmp(line, "GET /healthz", 12) == 0) {
                 const char *ok = "OK\n";
@@ -182,7 +189,7 @@ void handler_job(void *arg) {
                 continue;
             }
 
-            // Process one JSON request in 'line'
+            // [ANCHOR:HANDLER_PARSE_VALIDATE] Process one JSON request in 'line'
             struct timeval t0, t1; gettimeofday(&t0, NULL);
             metrics_inc_total();
             IsoRequest req;
@@ -197,6 +204,7 @@ void handler_job(void *arg) {
             }
             const char *request_id = req.request_id;
 
+            // [ANCHOR:HANDLER_LUHN]
             if (!luhn_check(req.pan)) {
                 const char *resp = "{\"status\":\"DECLINED\",\"reason\":\"luhn_failed\"}\n";
                 (void)write_all(fd, resp, strlen(resp));
@@ -206,6 +214,7 @@ void handler_job(void *arg) {
                 start = nl + 1;
                 continue;
             }
+            // [ANCHOR:HANDLER_AMOUNT]
             double amt = atof(req.amount_text);
             if (!(amt > 0.0) || amt > 10000.0) {
                 const char *resp = "{\"status\":\"DECLINED\",\"reason\":\"amount_invalid\"}\n";
@@ -216,7 +225,7 @@ void handler_job(void *arg) {
                 continue;
             }
 
-            // Risk engine (stub): currently always allow; placeholder for future rules
+            // [ANCHOR:HANDLER_RISK] Risk engine (stub): currently always allow; placeholder for future rules
             RiskDecision rdec; risk_evaluate(&req, &rdec);
             if (!rdec.allow) {
                 char body[128];
@@ -235,6 +244,7 @@ void handler_job(void *arg) {
             DBConnection *dbc = db_thread_get(ctx->db);
             int is_dup = 0;
             char db_status[32] = {0};
+            // [ANCHOR:HANDLER_DB_IDEMP] Insert hoặc lấy lại theo request_id (idempotent)
             if (db_insert_or_get_by_reqid(dbc, request_id, masked, req.amount_text, "APPROVED", &is_dup, db_status, sizeof(db_status)) != 0) {
                 const char *resp = "{\"status\":\"DECLINED\",\"reason\":\"db_error\"}\n";
                 (void)write_all(fd, resp, strlen(resp));
@@ -250,13 +260,15 @@ void handler_job(void *arg) {
                 : "{\"status\":\"APPROVED\"}\n";
             (void)write_all(fd, ok_body, strlen(ok_body));
             metrics_inc_approved();
+            // [ANCHOR:HANDLER_LATENCY_LOG] Tính latency và log JSON một dòng
             gettimeofday(&t1, NULL);
             long latency_us = (t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_usec - t0.tv_usec);
             log_message_json("INFO", "tx", request_id, "APPROVED", latency_us);
 
             start = nl + 1;
         }
-        // Move remaining partial data to the front
+        // [ANCHOR:HANDLER_PARTIAL_REMAINDER]
+        // Move remaining partial data to the front (giữ phần chưa hoàn thành ở đầu buffer)
         size_t remain = (buf + used) - start;
         if (remain > 0 && start != buf) memmove(buf, start, remain);
         used = remain;
@@ -266,6 +278,7 @@ void handler_job(void *arg) {
         }
     }
 
+    // [ANCHOR:HANDLER_CLOSE] Đóng socket và giải phóng context
     if (fd >= 0) close(fd);
     free(ctx);
 }

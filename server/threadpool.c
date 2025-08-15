@@ -1,3 +1,23 @@
+/*
+ * Thread Pool — Visual Overview / Sơ đồ tổng quan (EN + VN)
+ *
+ *              submit(job)
+ *  producers  --------------->  [ LOCK ]  queue (bounded FIFO)  [ UNLOCK ]
+ *                                        head ......... tail
+ *                                                ^ size<=cap
+ *                                                   |
+ *                                             condvar signal
+ *                                                   v
+ *                        [wait cv]  worker ----> pop one ----> run outside lock
+ *
+ *  EN: Backpressure — when size == cap, submit() returns -1 so caller can
+ *      fail fast (e.g., send {"reason":"server_busy"}) instead of queuing
+ *      unbounded work which would explode latency (p95/p99).
+ *
+ *  VN: Chống quá tải — khi hàng đợi đầy (size==cap), submit() trả -1 để bên
+ *      gọi (vòng accept) phản hồi "server_busy" ngay, không xếp hàng vô hạn.
+ *      Cách này giữ độ trễ (p95/p99) ổn định thay vì phình to khi quá tải.
+ */
 #include "threadpool.h"
 #include <pthread.h>
 #include <stdlib.h>
@@ -15,6 +35,7 @@ typedef struct Job {
 // Fixed-size thread pool with a bounded FIFO queue
 // VN: Số worker cố định; queue giới hạn để áp dụng backpressure khi quá tải.
 struct ThreadPool {
+    // [ANCHOR:TP_QUEUE_STRUCT] Hàng đợi FIFO có giới hạn (bounded) để áp dụng backpressure
     pthread_t *threads;
     int num_threads;
     Job *head;
@@ -32,9 +53,15 @@ static void *worker_main(void *arg) {
     ThreadPool *pool = (ThreadPool *)arg;
     for (;;) {
         pthread_mutex_lock(&pool->m);
+        // [ANCHOR:TP_WORKER_WAIT]
+        // EN: Wait until there is work OR shutdown requested
+        // VN: Chờ tới khi có việc HOẶC nhận tín hiệu tắt (shutdown)
         while (!pool->shutting_down && pool->size == 0) {
             pthread_cond_wait(&pool->cv, &pool->m);
         }
+        // [ANCHOR:TP_WORKER_EXIT]
+        // EN: Graceful exit when no more jobs and shutdown flag is set
+        // VN: Thoát êm khi đã yêu cầu shutdown và không còn job trong hàng đợi
         if (pool->shutting_down && pool->size == 0) {
             pthread_mutex_unlock(&pool->m);
             break;
@@ -46,6 +73,9 @@ static void *worker_main(void *arg) {
             pool->size--;
         }
         pthread_mutex_unlock(&pool->m);
+        // [ANCHOR:TP_EXECUTE_OUTSIDE_LOCK]
+        // EN: Execute job outside the lock to minimize contention
+        // VN: Chạy job ngoài phạm vi khóa để giảm tranh chấp mutex
         if (job) {
             job->fn(job->arg);
             free(job);
@@ -75,6 +105,7 @@ ThreadPool *threadpool_create(int num_threads, int queue_cap) {
         return NULL;
     }
     pool->num_threads = num_threads;
+    // [ANCHOR:TP_CREATE_SPAWN]
     for (int i = 0; i < num_threads; ++i) {
         if (pthread_create(&pool->threads[i], NULL, worker_main, pool) != 0) {
             perror("pthread_create");
@@ -102,6 +133,9 @@ int threadpool_submit(ThreadPool *pool, job_fn fn, void *arg) {
     job->next = NULL;
 
     pthread_mutex_lock(&pool->m);
+    // [ANCHOR:TP_SUBMIT_BACKPRESSURE]
+    // EN: Backpressure — refuse when queue is full (non-blocking submit)
+    // VN: Chống quá tải — từ chối khi hàng đợi đã đầy (không chặn tại đây)
     if (pool->size >= pool->cap) {
         pthread_mutex_unlock(&pool->m);
         free(job);
@@ -121,11 +155,15 @@ void threadpool_destroy(ThreadPool *pool) {
     if (!pool) return;
     pthread_mutex_lock(&pool->m);
     pool->shutting_down = 1;
+    // [ANCHOR:TP_DESTROY_BROADCAST_JOIN]
+    // EN: Wake all workers so they can observe shutdown and exit
+    // VN: Đánh thức tất cả worker để thấy cờ shutdown và thoát êm
     pthread_cond_broadcast(&pool->cv);
     pthread_mutex_unlock(&pool->m);
     for (int i = 0; i < pool->num_threads; ++i) pthread_join(pool->threads[i], NULL);
 
-    // free remaining jobs, if any
+    // EN: Free remaining jobs, if any (dropped on shutdown)
+    // VN: Giải phóng các job còn lại (nếu có) khi tắt dịch vụ
     Job *j = pool->head;
     while (j) { Job *n = j->next; free(j); j = n; }
 
