@@ -29,6 +29,9 @@
 #include "risk.h"
 #include "ledger.h"
 #include "version.h"
+#include "transaction_coordinator.h"
+#include "db_participant.h"
+#include "clearing_participant.h"
 
 /*
  * Simple connection handler stub.
@@ -106,6 +109,18 @@ void handler_job(void *arg) {
     HandlerContext *ctx = (HandlerContext *)arg;
     if (!ctx) return;
     int fd = ctx->client_fd;
+    
+    // Initialize 2PC coordinator for this handler
+    static __thread TransactionCoordinator *coordinator = NULL;
+    if (!coordinator) {
+        coordinator = txn_coordinator_init();
+        if (!coordinator) {
+            log_message_json("ERROR", "handler", NULL, "Failed to init 2PC coordinator", -1);
+            close(fd);
+            free(ctx);
+            return;
+        }
+    }
     // [ANCHOR:HANDLER_TIMEOUTS]
     // 1) Set simple read/write timeouts to avoid hanging forever (keep-alive friendly)
     struct timeval tv;
@@ -241,25 +256,135 @@ void handler_job(void *arg) {
 
             char masked[64];
             mask_pan(req.pan, masked, sizeof(masked));
-            DBConnection *dbc = db_thread_get(ctx->db);
-            int is_dup = 0;
-            char db_status[32] = {0};
-            // [ANCHOR:HANDLER_DB_IDEMP] Insert hoặc lấy lại theo request_id (idempotent)
-            if (db_insert_or_get_by_reqid(dbc, request_id, masked, req.amount_text, "APPROVED", &is_dup, db_status, sizeof(db_status)) != 0) {
-                const char *resp = "{\"status\":\"DECLINED\",\"reason\":\"db_error\"}\n";
+            
+            // [ANCHOR:HANDLER_2PC] Use 2-Phase Commit for distributed transaction
+            
+            // Generate unique transaction ID
+            char txn_id[MAX_TRANSACTION_ID_LEN];
+            snprintf(txn_id, sizeof(txn_id), "visa_%s_%ld", request_id, time(NULL));
+            
+            // Begin distributed transaction
+            Transaction *txn = txn_begin(coordinator, txn_id);
+            if (!txn) {
+                const char *resp = "{\"status\":\"DECLINED\",\"reason\":\"txn_init_failed\"}\n";
                 (void)write_all(fd, resp, strlen(resp));
                 metrics_inc_declined();
                 log_message_json("ERROR", "tx", request_id, "DECLINED", -1);
                 start = nl + 1;
                 continue;
             }
-            // Ledger hold (stub)
-            (void)ledger_authorize_hold(&req);
-            const char *ok_body = is_dup
-                ? "{\"status\":\"APPROVED\",\"idempotent\":true}\n"
-                : "{\"status\":\"APPROVED\"}\n";
-            (void)write_all(fd, ok_body, strlen(ok_body));
-            metrics_inc_approved();
+            
+            // Initialize participants
+            DBConnection *dbc = db_thread_get(ctx->db);
+            DBParticipantContext *db_ctx = db_participant_init(dbc);
+            ClearingParticipantContext *clearing_ctx = clearing_participant_init(NULL, 30);
+            
+            if (!db_ctx || !clearing_ctx) {
+                const char *resp = "{\"status\":\"DECLINED\",\"reason\":\"participant_init_failed\"}\n";
+                (void)write_all(fd, resp, strlen(resp));
+                metrics_inc_declined();
+                log_message_json("ERROR", "tx", request_id, "DECLINED", -1);
+                
+                if (db_ctx) db_participant_destroy(db_ctx);
+                if (clearing_ctx) clearing_participant_destroy(clearing_ctx);
+                txn_abort(coordinator, txn);
+                start = nl + 1;
+                continue;
+            }
+            
+            // Register participants in transaction
+            if (txn_register_participant(txn, "database", db_ctx,
+                                       db_participant_prepare,
+                                       db_participant_commit,
+                                       db_participant_abort) != 0 ||
+                txn_register_participant(txn, "clearing", clearing_ctx,
+                                       clearing_participant_prepare,
+                                       clearing_participant_commit,
+                                       clearing_participant_abort) != 0) {
+                
+                const char *resp = "{\"status\":\"DECLINED\",\"reason\":\"participant_registration_failed\"}\n";
+                (void)write_all(fd, resp, strlen(resp));
+                metrics_inc_declined();
+                log_message_json("ERROR", "tx", request_id, "DECLINED", -1);
+                
+                db_participant_destroy(db_ctx);
+                clearing_participant_destroy(clearing_ctx);
+                txn_abort(coordinator, txn);
+                start = nl + 1;
+                continue;
+            }
+            
+            // Prepare transaction data
+            if (db_participant_begin(db_ctx, txn_id) != 0) {
+                const char *resp = "{\"status\":\"DECLINED\",\"reason\":\"db_begin_failed\"}\n";
+                (void)write_all(fd, resp, strlen(resp));
+                metrics_inc_declined();
+                log_message_json("ERROR", "tx", request_id, "DECLINED", -1);
+                
+                db_participant_destroy(db_ctx);
+                clearing_participant_destroy(clearing_ctx);
+                txn_abort(coordinator, txn);
+                start = nl + 1;
+                continue;
+            }
+            
+            if (clearing_participant_set_transaction(clearing_ctx, txn_id, masked, 
+                                                    req.amount_text, "MERCHANT001") != 0) {
+                const char *resp = "{\"status\":\"DECLINED\",\"reason\":\"clearing_setup_failed\"}\n";
+                (void)write_all(fd, resp, strlen(resp));
+                metrics_inc_declined();
+                log_message_json("ERROR", "tx", request_id, "DECLINED", -1);
+                
+                db_participant_destroy(db_ctx);
+                clearing_participant_destroy(clearing_ctx);
+                txn_abort(coordinator, txn);
+                start = nl + 1;
+                continue;
+            }
+            
+            // Execute database operations within transaction
+            int is_dup = 0;
+            char db_status[32] = {0};
+            if (db_participant_insert_transaction(db_ctx, request_id, masked, 
+                                                req.amount_text, "APPROVED", 
+                                                &is_dup, db_status, sizeof(db_status)) != 0) {
+                const char *resp = "{\"status\":\"DECLINED\",\"reason\":\"db_error\"}\n";
+                (void)write_all(fd, resp, strlen(resp));
+                metrics_inc_declined();
+                log_message_json("ERROR", "tx", request_id, "DECLINED", -1);
+                
+                db_participant_destroy(db_ctx);
+                clearing_participant_destroy(clearing_ctx);
+                txn_abort(coordinator, txn);
+                start = nl + 1;
+                continue;
+            }
+            
+            // Execute 2-Phase Commit
+            int commit_result = txn_commit(coordinator, txn);
+            
+            // Cleanup participants
+            db_participant_destroy(db_ctx);
+            clearing_participant_destroy(clearing_ctx);
+            
+            if (commit_result == 0) {
+                // Success
+                const char *ok_body = is_dup
+                    ? "{\"status\":\"APPROVED\",\"idempotent\":true,\"txn_id\":\"%s\"}\n"
+                    : "{\"status\":\"APPROVED\",\"txn_id\":\"%s\"}\n";
+                char response[256];
+                snprintf(response, sizeof(response), ok_body, txn_id);
+                (void)write_all(fd, response, strlen(response));
+                metrics_inc_approved();
+            } else {
+                // 2PC failed
+                const char *resp = "{\"status\":\"DECLINED\",\"reason\":\"commit_failed\"}\n";
+                (void)write_all(fd, resp, strlen(resp));
+                metrics_inc_declined();
+                log_message_json("ERROR", "tx", request_id, "DECLINED", -1);
+                start = nl + 1;
+                continue;
+            }
             // [ANCHOR:HANDLER_LATENCY_LOG] Tính latency và log JSON một dòng
             gettimeofday(&t1, NULL);
             long latency_us = (t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_usec - t0.tv_usec);
@@ -281,4 +406,6 @@ void handler_job(void *arg) {
     // [ANCHOR:HANDLER_CLOSE] Đóng socket và giải phóng context
     if (fd >= 0) close(fd);
     free(ctx);
+    
+    // Note: coordinator is thread-local and will be cleaned up when thread exits
 }

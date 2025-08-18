@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep:*)",
+      "Bash(make:*)",
+      "Bash(sudo service:*)",
+      "Bash(cat:*)",
+      "Bash(dos2unix:*)",
+      "Bash(sed:*)",
+      "Bash(./tests/keepalive.sh:*)",
+      "Bash(kill:*)",
+      "Bash(mkdir:*)",
+      "Bash(gcc:*)",
+      "Bash(./build/test_2pc)",
+      "Bash(chmod:*)",
+      "Bash(bash:*)",
+      "Bash(./build/server)",
+      "Bash(./build/test_2pc_simple)",
+      "Bash(./build/test_clearing)",
+      "Bash(./build/test_stress)"
+    ],
+    "deny": [],
+    "defaultMode": "acceptEdits"
+  }
+}
