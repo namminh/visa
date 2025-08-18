@@ -135,10 +135,15 @@ void handler_job(void *arg) {
     size_t used = 0;
 
     // [ANCHOR:HANDLER_READ_LOOP]
-    // Minimal HTTP request state for secure endpoint
+    // Minimal HTTP request state for secure endpoint(s)
     int http_collecting = 0;           // inside HTTP header collection
     int http_is_secure_ping = 0;       // target path is /secure/ping
+    int http_is_secure_tx = 0;         // target path is /secure/tx (POST JSON)
     char http_authz[256]; http_authz[0] = '\0';
+    long http_content_length = -1;     // Content-Length for POST
+    long http_body_remaining = 0;      // remaining bytes to read for body
+    size_t http_body_used = 0;         // collected body bytes
+    char http_body[8192];              // body buffer cap
 
     for (;;) {
         // Read more data
@@ -174,7 +179,6 @@ void handler_job(void *arg) {
                         // Expect: Authorization: Bearer <token>
                         if (http_authz[0] != '\0' && (p = strstr(http_authz, "Bearer ")) != NULL) {
                             p += 7; // after 'Bearer '
-                            // trim spaces
                             while (*p == ' ') p++;
                             if (strcmp(p, ctx->api_token) == 0) authorized = 1;
                         }
@@ -187,7 +191,7 @@ void handler_job(void *arg) {
                                          "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
                                          blen, body);
                         if (m > 0 && (size_t)m < sizeof(resp)) (void)write_all(fd, resp, (size_t)m);
-                    } else {
+                    } else if (!authorized && (http_is_secure_ping || http_is_secure_tx)) {
                         const char *body = "{\"error\":\"unauthorized\"}\n";
                         char resp[256];
                         int blen = (int)strlen(body);
@@ -195,6 +199,20 @@ void handler_job(void *arg) {
                                          "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
                                          blen, body);
                         if (m > 0 && (size_t)m < sizeof(resp)) (void)write_all(fd, resp, (size_t)m);
+                    } else if (authorized && http_is_secure_tx) {
+                        // Prepare to read body
+                        if (http_content_length >= 0 && http_content_length <= (long)sizeof(http_body)) {
+                            http_body_remaining = http_content_length; // begin body mode
+                        } else {
+                            const char *body = "{\"error\":\"bad_content_length\"}\n";
+                            char resp[256];
+                            int blen = (int)strlen(body);
+                            int m = snprintf(resp, sizeof(resp),
+                                             "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+                                             blen, body);
+                            if (m > 0 && (size_t)m < sizeof(resp)) (void)write_all(fd, resp, (size_t)m);
+                            http_is_secure_tx = 0; // abort
+                        }
                     }
                     http_collecting = 0; http_is_secure_ping = 0; http_authz[0] = '\0';
                 }
@@ -209,7 +227,19 @@ void handler_job(void *arg) {
                 while (*p && *p != ' ' && i + 1 < sizeof(path)) path[i++] = *p++;
                 path[i] = '\0';
                 if (strcmp(path, "/secure/ping") == 0) {
-                    http_collecting = 1; http_is_secure_ping = 1; http_authz[0] = '\0';
+                    http_collecting = 1; http_is_secure_ping = 1; http_is_secure_tx = 0; http_authz[0] = '\0'; http_content_length = -1;
+                    start = nl + 1;
+                    continue;
+                }
+            }
+            if (strncmp(line, "POST ", 5) == 0 && strstr(line, "HTTP/1.1") != NULL) {
+                const char *p = line + 5;
+                char path[128] = {0}; size_t i = 0;
+                while (*p && *p != ' ' && i + 1 < sizeof(path)) path[i++] = *p++;
+                path[i] = '\0';
+                if (strcmp(path, "/secure/tx") == 0) {
+                    http_collecting = 1; http_is_secure_ping = 0; http_is_secure_tx = 1; http_authz[0] = '\0';
+                    http_content_length = -1; http_body_remaining = 0; http_body_used = 0;
                     start = nl + 1;
                     continue;
                 }
@@ -220,6 +250,10 @@ void handler_job(void *arg) {
                     const char *v = line + 14;
                     while (*v == ' ' || *v == '\t') v++;
                     snprintf(http_authz, sizeof(http_authz), "%s", v);
+                } else if (strncasecmp(line, "Content-Length:", 15) == 0) {
+                    const char *v = line + 15;
+                    while (*v == ' ' || *v == '\t') v++;
+                    http_content_length = strtol(v, NULL, 10);
                 }
                 start = nl + 1;
                 continue;
@@ -493,6 +527,130 @@ void handler_job(void *arg) {
 
             start = nl + 1;
         }
+        // If collecting HTTP POST body, consume raw bytes before normal framing move
+        if (http_body_remaining > 0) {
+            // 'start' points to the first unprocessed byte
+            char *raw_start = start;
+            size_t avail = (size_t)((buf + used) - raw_start);
+            if (avail > 0) {
+                size_t take = avail;
+                if ((long)take > http_body_remaining) take = (size_t)http_body_remaining;
+                if (http_body_used + take <= sizeof(http_body)) {
+                    memcpy(http_body + http_body_used, raw_start, take);
+                    http_body_used += take;
+                    http_body_remaining -= (long)take;
+                } else {
+                    // overflow safeguard, drop
+                    http_body_remaining = 0;
+                }
+                raw_start += take;
+                // Shift remainder down into buffer
+                size_t remain2 = (buf + used) - raw_start;
+                if (remain2 > 0 && raw_start != buf) memmove(buf, raw_start, remain2);
+                used = remain2;
+            }
+            if (http_body_remaining == 0 && http_is_secure_tx) {
+                // NUL-terminate body
+                size_t body_len = http_body_used < sizeof(http_body) ? http_body_used : sizeof(http_body) - 1;
+                http_body[body_len] = '\0';
+
+                // Process JSON body with existing transaction pipeline (inline)
+                struct timeval t0, t1; gettimeofday(&t0, NULL);
+                metrics_inc_total();
+                IsoRequest req;
+                char perr[64] = {0};
+                char body_json[512]; body_json[0] = '\0';
+                int http_code = 200; const char *http_reason = "OK";
+                if (iso_parse_request_line(http_body, &req, perr, sizeof(perr)) != 0) {
+                    snprintf(body_json, sizeof(body_json), "{\"status\":\"DECLINED\",\"reason\":\"bad_request\"}\n");
+                    metrics_inc_declined(); http_code = 400; http_reason = "Bad Request";
+                } else if (!luhn_check(req.pan)) {
+                    snprintf(body_json, sizeof(body_json), "{\"status\":\"DECLINED\",\"reason\":\"luhn_failed\"}\n");
+                    metrics_inc_declined(); metrics_inc_risk_declined(); http_code = 400; http_reason = "Bad Request";
+                } else {
+                    double amt = atof(req.amount_text);
+                    if (!(amt > 0.0) || amt > 10000.0) {
+                        snprintf(body_json, sizeof(body_json), "{\"status\":\"DECLINED\",\"reason\":\"amount_invalid\"}\n");
+                        metrics_inc_declined(); http_code = 400; http_reason = "Bad Request";
+                    } else {
+                        RiskDecision rdec; risk_evaluate(&req, &rdec);
+                        if (!rdec.allow) {
+                            snprintf(body_json, sizeof(body_json), "{\"status\":\"DECLINED\",\"reason\":\"%s\"}\n", rdec.reason[0] ? rdec.reason : "risk_decline");
+                            metrics_inc_declined(); http_code = 402; http_reason = "Payment Required";
+                        } else {
+                            char masked[64]; mask_pan(req.pan, masked, sizeof(masked));
+                            char txn_id[MAX_TRANSACTION_ID_LEN]; snprintf(txn_id, sizeof(txn_id), "visa_%s_%ld", req.request_id, time(NULL));
+                            Transaction *txn = txn_begin(coordinator, txn_id);
+                            if (!txn) {
+                                snprintf(body_json, sizeof(body_json), "{\"status\":\"DECLINED\",\"reason\":\"txn_init_failed\"}\n");
+                                metrics_inc_declined(); http_code = 500; http_reason = "Internal Server Error";
+                            } else {
+                                DBConnection *dbc = db_thread_get(ctx->db);
+                                DBParticipantContext *db_ctx = db_participant_init(dbc);
+                                ClearingParticipantContext *clearing_ctx = clearing_participant_init(NULL, 30);
+                                if (!db_ctx || !clearing_ctx) {
+                                    snprintf(body_json, sizeof(body_json), "{\"status\":\"DECLINED\",\"reason\":\"participant_init_failed\"}\n");
+                                    metrics_inc_declined(); http_code = 500; http_reason = "Internal Server Error";
+                                    if (db_ctx) db_participant_destroy(db_ctx);
+                                    if (clearing_ctx) clearing_participant_destroy(clearing_ctx);
+                                    txn_abort(coordinator, txn);
+                                } else if (txn_register_participant(txn, "database", db_ctx, db_participant_prepare, db_participant_commit, db_participant_abort) != 0 ||
+                                           txn_register_participant(txn, "clearing", clearing_ctx, clearing_participant_prepare, clearing_participant_commit, clearing_participant_abort) != 0) {
+                                    snprintf(body_json, sizeof(body_json), "{\"status\":\"DECLINED\",\"reason\":\"participant_registration_failed\"}\n");
+                                    metrics_inc_declined(); http_code = 500; http_reason = "Internal Server Error";
+                                    db_participant_destroy(db_ctx); clearing_participant_destroy(clearing_ctx); txn_abort(coordinator, txn);
+                                } else if (db_participant_begin(db_ctx, txn_id) != 0) {
+                                    snprintf(body_json, sizeof(body_json), "{\"status\":\"DECLINED\",\"reason\":\"db_begin_failed\"}\n");
+                                    metrics_inc_declined(); http_code = 500; http_reason = "Internal Server Error";
+                                    db_participant_destroy(db_ctx); clearing_participant_destroy(clearing_ctx); txn_abort(coordinator, txn);
+                                } else if (clearing_participant_set_transaction(clearing_ctx, txn_id, masked, req.amount_text, "MERCHANT001") != 0) {
+                                    snprintf(body_json, sizeof(body_json), "{\"status\":\"DECLINED\",\"reason\":\"clearing_setup_failed\"}\n");
+                                    metrics_inc_declined(); http_code = 502; http_reason = "Bad Gateway";
+                                    db_participant_destroy(db_ctx); clearing_participant_destroy(clearing_ctx); txn_abort(coordinator, txn);
+                                } else {
+                                    int is_dup = 0; char db_status[32] = {0};
+                                    if (db_participant_insert_transaction(db_ctx, req.request_id, masked, req.amount_text, "APPROVED", &is_dup, db_status, sizeof(db_status)) != 0) {
+                                        snprintf(body_json, sizeof(body_json), "{\"status\":\"DECLINED\",\"reason\":\"db_error\"}\n");
+                                        metrics_inc_declined(); http_code = 500; http_reason = "Internal Server Error";
+                                        db_participant_destroy(db_ctx); clearing_participant_destroy(clearing_ctx); txn_abort(coordinator, txn);
+                                    } else {
+                                        int commit_result = txn_commit(coordinator, txn);
+                                        db_participant_destroy(db_ctx); clearing_participant_destroy(clearing_ctx);
+                                        if (commit_result == 0) {
+                                            if (is_dup) snprintf(body_json, sizeof(body_json), "{\"status\":\"APPROVED\",\"idempotent\":true,\"txn_id\":\"%s\"}\n", txn_id);
+                                            else snprintf(body_json, sizeof(body_json), "{\"status\":\"APPROVED\",\"txn_id\":\"%s\"}\n", txn_id);
+                                            metrics_inc_approved();
+                                        } else {
+                                            (void)reversal_enqueue(txn_id, masked, req.amount_text, "MERCHANT001");
+                                            snprintf(body_json, sizeof(body_json), "{\"status\":\"DECLINED\",\"reason\":\"commit_failed\"}\n");
+                                            metrics_inc_declined(); http_code = 500; http_reason = "Internal Server Error";
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                }
+
+                // emit HTTP response
+                if (body_json[0] != '\0') {
+                    size_t bl = strlen(body_json);
+                    char hdr[256];
+                    int m = snprintf(hdr, sizeof(hdr),
+                                     "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+                                     http_code, http_reason, bl);
+                    if (m > 0 && (size_t)m < sizeof(hdr)) {
+                        (void)write_all(fd, hdr, (size_t)m);
+                        (void)write_all(fd, body_json, bl);
+                    }
+                }
+
+                // reset http body state
+                http_is_secure_tx = 0; http_body_used = 0; http_content_length = -1; // body_remaining already 0
+                continue;
+            }
+
         // [ANCHOR:HANDLER_PARTIAL_REMAINDER]
         // Move remaining partial data to the front (giữ phần chưa hoàn thành ở đầu buffer)
         size_t remain = (buf + used) - start;
@@ -503,7 +661,8 @@ void handler_job(void *arg) {
             used = 0;
         }
     }
-
+    }
+    
     // [ANCHOR:HANDLER_CLOSE] Đóng socket và giải phóng context
     if (fd >= 0) close(fd);
     free(ctx);

@@ -87,6 +87,8 @@ export THREADS=8 QUEUE_CAP=2048
 
 - Quick tour (VN): `CODE_READING_QUICK.md`
 - Code reading chuyên sâu (VN): `CODE_READING_CHUYEN_SAU.md`
+- Microservice guide (VN): `MICROSERVICE_PAYMENTS_VN.md`
+- NAPAS QR clearing flow (VN): `NAPAS_QR_FLOW_VN.md`
 - Vietnamese quick start: `HUONGDAN.md`
 - Vietnamese scenario-based test guide: `TEST_HUONGDAN.md`
 - PostgreSQL permissions guide: `DB_PERMISSIONS.md`
