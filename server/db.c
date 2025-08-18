@@ -217,3 +217,56 @@ int db_is_ready(DBConnection *dbc) {
     if (!dbc || !dbc->conn) return 0;
     return PQstatus(dbc->conn) == CONNECTION_OK;
 }
+
+int db_get_tx_by_request_id(DBConnection *dbc,
+                            const char *request_id,
+                            char *out_json,
+                            size_t out_json_sz) {
+    if (!dbc || !dbc->conn || !request_id || !*request_id || !out_json || out_json_sz == 0) {
+        return -1;
+    }
+
+    const char *paramValues[1] = { request_id };
+    int paramLengths[1] = { 0 };
+    int paramFormats[1] = { 0 };
+
+    pthread_mutex_lock(&dbc->mu);
+    PGresult *res = PQexecParams(
+        dbc->conn,
+        "SELECT request_id, amount::text, status FROM transactions WHERE request_id=$1 LIMIT 1",
+        1,
+        NULL,
+        paramValues,
+        paramLengths,
+        paramFormats,
+        0
+    );
+    if (!res) {
+        pthread_mutex_unlock(&dbc->mu);
+        return -1;
+    }
+    ExecStatusType st = PQresultStatus(res);
+    if (st != PGRES_TUPLES_OK) {
+        PQclear(res);
+        pthread_mutex_unlock(&dbc->mu);
+        return -1;
+    }
+    if (PQntuples(res) != 1) {
+        PQclear(res);
+        pthread_mutex_unlock(&dbc->mu);
+        return -1; // not found
+    }
+    const char *req = PQgetvalue(res, 0, 0);
+    const char *amt = PQgetvalue(res, 0, 1);
+    const char *st_str = PQgetvalue(res, 0, 2);
+
+    int n = snprintf(out_json, out_json_sz,
+                     "{\"request_id\":\"%s\",\"amount\":\"%s\",\"status\":\"%s\"}\n",
+                     req ? req : "",
+                     amt ? amt : "",
+                     st_str ? st_str : "");
+    PQclear(res);
+    pthread_mutex_unlock(&dbc->mu);
+    if (n < 0 || (size_t)n >= out_json_sz) return -1;
+    return 0;
+}

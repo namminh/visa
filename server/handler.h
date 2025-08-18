@@ -8,6 +8,7 @@
 typedef struct HandlerContext {
     int client_fd;        ///< Socket file descriptor
     DBConnection *db;     ///< Shared database connection
+    const char *api_token;///< Optional API token for secure endpoints
 } HandlerContext;
 
 /**

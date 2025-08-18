@@ -11,6 +11,7 @@ typedef struct Config {
     int listen_port;     ///< TCP port to listen on
     int num_threads;     ///< number of worker threads in the thread pool
     int queue_cap;       ///< max pending jobs in the thread pool
+    const char *api_token; ///< optional bearer token for secure endpoints
 } Config;
 
 /**

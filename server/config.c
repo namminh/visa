@@ -35,6 +35,8 @@ int config_init(Config *cfg, int argc, char *argv[]) {
     const char *qcap_env = getenv("QUEUE_CAP");  // Tuỳ chọn: sức chứa hàng đợi job
     cfg->queue_cap = qcap_env ? atoi(qcap_env) : 1024;
     if (cfg->queue_cap <= 0) cfg->queue_cap = 1024;
+    // Optional API token for secure HTTP-ish endpoints
+    cfg->api_token = getenv("API_TOKEN");
     return 0;
 }
 

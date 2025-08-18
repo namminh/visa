@@ -117,6 +117,7 @@ int net_server_run(const Config *cfg, ThreadPool *pool, DBConnection *dbc) {
         }
         ctx->client_fd = fd;
         ctx->db = dbc;
+        ctx->api_token = cfg->api_token;
 
         // EN: Submit to thread pool; if queue is full, send an error and drop
         // VN: Đẩy vào threadpool; nếu hàng đợi đầy, trả "server_busy" rồi đóng

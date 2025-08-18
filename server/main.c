@@ -19,6 +19,7 @@
 #include "risk.h"
 #include "ledger.h"
 #include "clearing.h"
+#include "reversal.h"
 #include <stdio.h>
 
 int main(int argc, char *argv[]) {
@@ -31,6 +32,7 @@ int main(int argc, char *argv[]) {
     risk_init();
     ledger_init();
     clearing_init();
+    reversal_init();
     // Kết nối cơ sở dữ liệu (sẽ dùng làm bootstrap cho per-thread DB)
     DBConnection *dbc = db_connect(cfg.db_uri);
     if (!dbc) {
@@ -48,6 +50,7 @@ int main(int argc, char *argv[]) {
     threadpool_destroy(pool);
     db_disconnect(dbc);
     log_close();
+    reversal_shutdown();
     config_free(&cfg);
     return rc;
 }

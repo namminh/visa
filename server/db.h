@@ -70,3 +70,13 @@ int db_insert_or_get_by_reqid(DBConnection *dbc,
  * Check if the DB connection is ready (CONNECTION_OK).
  */
 int db_is_ready(DBConnection *dbc);
+
+/**
+ * Fetch a transaction by request_id and format as a small JSON.
+ * Returns 0 if found, non-zero on error or not found.
+ * The JSON shape is: {"request_id":"..","amount":"..","status":".."}\n
+ */
+int db_get_tx_by_request_id(DBConnection *dbc,
+                            const char *request_id,
+                            char *out_json,
+                            size_t out_json_sz);

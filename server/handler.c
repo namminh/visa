@@ -29,9 +29,11 @@
 #include "risk.h"
 #include "ledger.h"
 #include "version.h"
+#include "reversal.h"
 #include "transaction_coordinator.h"
 #include "db_participant.h"
 #include "clearing_participant.h"
+#include "db.h"
 
 /*
  * Simple connection handler stub.
@@ -133,6 +135,11 @@ void handler_job(void *arg) {
     size_t used = 0;
 
     // [ANCHOR:HANDLER_READ_LOOP]
+    // Minimal HTTP request state for secure endpoint
+    int http_collecting = 0;           // inside HTTP header collection
+    int http_is_secure_ping = 0;       // target path is /secure/ping
+    char http_authz[256]; http_authz[0] = '\0';
+
     for (;;) {
         // Read more data
         ssize_t n = read(fd, buf + used, sizeof(buf) - 1 - used);
@@ -155,10 +162,65 @@ void handler_job(void *arg) {
             char *nl = memchr(start, '\n', (buf + used) - start);
             if (!nl) break;
             *nl = '\0';
-            // Skip empty lines
+            // Skip empty lines unless we are collecting HTTP headers
             const char *line = start;
             while (*line && isspace((unsigned char)*line)) line++;
             if (*line == '\0') {
+                if (http_collecting) {
+                    // End of headers: validate Authorization
+                    int authorized = 0;
+                    if (ctx->api_token && *ctx->api_token) {
+                        const char *p = NULL;
+                        // Expect: Authorization: Bearer <token>
+                        if (http_authz[0] != '\0' && (p = strstr(http_authz, "Bearer ")) != NULL) {
+                            p += 7; // after 'Bearer '
+                            // trim spaces
+                            while (*p == ' ') p++;
+                            if (strcmp(p, ctx->api_token) == 0) authorized = 1;
+                        }
+                    }
+                    if (authorized && http_is_secure_ping) {
+                        const char *body = "{\"ok\":true}\n";
+                        char resp[256];
+                        int blen = (int)strlen(body);
+                        int m = snprintf(resp, sizeof(resp),
+                                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+                                         blen, body);
+                        if (m > 0 && (size_t)m < sizeof(resp)) (void)write_all(fd, resp, (size_t)m);
+                    } else {
+                        const char *body = "{\"error\":\"unauthorized\"}\n";
+                        char resp[256];
+                        int blen = (int)strlen(body);
+                        int m = snprintf(resp, sizeof(resp),
+                                         "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+                                         blen, body);
+                        if (m > 0 && (size_t)m < sizeof(resp)) (void)write_all(fd, resp, (size_t)m);
+                    }
+                    http_collecting = 0; http_is_secure_ping = 0; http_authz[0] = '\0';
+                }
+                start = nl + 1;
+                continue;
+            }
+
+            // Minimal HTTP secure endpoint parsing before other routes
+            if (strncmp(line, "GET ", 4) == 0 && strstr(line, "HTTP/1.1") != NULL) {
+                const char *p = line + 4;
+                char path[128] = {0}; size_t i = 0;
+                while (*p && *p != ' ' && i + 1 < sizeof(path)) path[i++] = *p++;
+                path[i] = '\0';
+                if (strcmp(path, "/secure/ping") == 0) {
+                    http_collecting = 1; http_is_secure_ping = 1; http_authz[0] = '\0';
+                    start = nl + 1;
+                    continue;
+                }
+            }
+            if (http_collecting) {
+                // Header line parsing; look for Authorization
+                if (strncasecmp(line, "Authorization:", 14) == 0) {
+                    const char *v = line + 14;
+                    while (*v == ' ' || *v == '\t') v++;
+                    snprintf(http_authz, sizeof(http_authz), "%s", v);
+                }
                 start = nl + 1;
                 continue;
             }
@@ -184,12 +246,49 @@ void handler_job(void *arg) {
             if (strncmp(line, "GET /metrics", 12) == 0) {
                 unsigned long t=0,a=0,d=0,b=0; metrics_snapshot(&t,&a,&d,&b);
                 unsigned long rd = metrics_get_risk_declined();
-                char m[256];
+                unsigned long cmt = metrics_get_2pc_committed();
+                unsigned long abt = metrics_get_2pc_aborted();
+                unsigned long cbsc = metrics_get_cb_short_circuit();
+                unsigned long renq = metrics_get_reversal_enqueued();
+                unsigned long rokn = metrics_get_reversal_succeeded();
+                unsigned long rfail = metrics_get_reversal_failed();
+                char m[640];
                 int mlen = snprintf(m, sizeof(m),
-                                    "{\"total\":%lu,\"approved\":%lu,\"declined\":%lu,\"server_busy\":%lu,\"risk_declined\":%lu}\n",
-                                    t,a,d,b,rd);
+                                    "{\"total\":%lu,\"approved\":%lu,\"declined\":%lu,\"server_busy\":%lu,\"risk_declined\":%lu,\"twopc_committed\":%lu,\"twopc_aborted\":%lu,\"clearing_cb_short_circuit\":%lu,\"reversal_enqueued\":%lu,\"reversal_succeeded\":%lu,\"reversal_failed\":%lu}\n",
+                                    t,a,d,b,rd,cmt,abt,cbsc,renq,rokn,rfail);
                 if (mlen > 0 && (size_t)mlen < sizeof(m)) (void)write_all(fd, m, (size_t)mlen);
                 log_message_json("INFO", "metrics", NULL, "SNAPSHOT", -1);
+                start = nl + 1;
+                continue;
+            }
+            if (strncmp(line, "GET /tx?", 8) == 0) {
+                // Very simple query parser: expect request_id in query string
+                const char *q = strstr(line, "request_id=");
+                char rid[128] = {0};
+                if (q) {
+                    q += strlen("request_id=");
+                    size_t i = 0;
+                    while (*q && *q != ' ' && *q != '\r' && *q != '\n' && *q != '&' && i + 1 < sizeof(rid)) {
+                        rid[i++] = *q++;
+                    }
+                    rid[i] = '\0';
+                }
+
+                if (rid[0] == '\0') {
+                    const char *resp = "{\"error\":\"missing_request_id\"}\n";
+                    (void)write_all(fd, resp, strlen(resp));
+                    start = nl + 1;
+                    continue;
+                }
+
+                DBConnection *dbc_q = db_thread_get(ctx->db);
+                char json[256];
+                if (db_get_tx_by_request_id(dbc_q, rid, json, sizeof(json)) == 0) {
+                    (void)write_all(fd, json, strlen(json));
+                } else {
+                    const char *nf = "{\"status\":\"NOT_FOUND\"}\n";
+                    (void)write_all(fd, nf, strlen(nf));
+                }
                 start = nl + 1;
                 continue;
             }
@@ -378,6 +477,8 @@ void handler_job(void *arg) {
                 metrics_inc_approved();
             } else {
                 // 2PC failed
+                // Best-effort enqueue reversal to clear any external holds/charges
+                (void)reversal_enqueue(txn_id, masked, req.amount_text, "MERCHANT001");
                 const char *resp = "{\"status\":\"DECLINED\",\"reason\":\"commit_failed\"}\n";
                 (void)write_all(fd, resp, strlen(resp));
                 metrics_inc_declined();

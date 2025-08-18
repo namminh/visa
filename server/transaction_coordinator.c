@@ -5,10 +5,11 @@
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
+#include "metrics.h"
 
 #define MAX_ACTIVE_TRANSACTIONS 1024
-#define DEFAULT_PREPARE_TIMEOUT 30  // seconds
-#define DEFAULT_COMMIT_TIMEOUT 30   // seconds
+static int DEFAULT_PREPARE_TIMEOUT = 30;  // seconds
+static int DEFAULT_COMMIT_TIMEOUT = 30;   // seconds
 
 struct TransactionCoordinator {
     pthread_mutex_t mutex;
@@ -17,6 +18,9 @@ struct TransactionCoordinator {
     
     // Transaction log for persistence/recovery
     FILE *txn_log;
+    // Configurable timeouts
+    int prepare_timeout_seconds;
+    int commit_timeout_seconds;
 };
 
 static const char *txn_state_strings[] = {
@@ -92,6 +96,14 @@ TransactionCoordinator *txn_coordinator_init(void) {
     memset(coordinator->active_transactions, 0, sizeof(coordinator->active_transactions));
     coordinator->active_count = 0;
     
+    // Load env timeouts (optional)
+    const char *pt = getenv("TWOPC_PREPARE_TIMEOUT");
+    const char *ct = getenv("TWOPC_COMMIT_TIMEOUT");
+    coordinator->prepare_timeout_seconds = pt ? atoi(pt) : DEFAULT_PREPARE_TIMEOUT;
+    coordinator->commit_timeout_seconds = ct ? atoi(ct) : DEFAULT_COMMIT_TIMEOUT;
+    if (coordinator->prepare_timeout_seconds <= 0) coordinator->prepare_timeout_seconds = DEFAULT_PREPARE_TIMEOUT;
+    if (coordinator->commit_timeout_seconds <= 0) coordinator->commit_timeout_seconds = DEFAULT_COMMIT_TIMEOUT;
+
     // Open transaction log for persistence
     coordinator->txn_log = fopen("logs/transactions.log", "a");
     if (!coordinator->txn_log) {
@@ -154,8 +166,8 @@ Transaction *txn_begin(TransactionCoordinator *coordinator, const char *txn_id) 
     txn->state = TXN_INIT;
     txn->participant_count = 0;
     txn->start_time = time(NULL);
-    txn->prepare_timeout = txn->start_time + DEFAULT_PREPARE_TIMEOUT;
-    txn->commit_timeout = txn->start_time + DEFAULT_COMMIT_TIMEOUT;
+    txn->prepare_timeout = txn->start_time + coordinator->prepare_timeout_seconds;
+    txn->commit_timeout = txn->start_time + coordinator->commit_timeout_seconds;
     
     memset(txn->participants, 0, sizeof(txn->participants));
     
@@ -208,12 +220,12 @@ int txn_commit(TransactionCoordinator *coordinator, Transaction *txn) {
     
     const char *txn_id = txn->transaction_id;
     
-    // Phase 1: PREPARE
+    // Phase 1: PREPARE (mark under lock, then release lock for I/O)
     txn->state = TXN_PREPARING;
     log_transaction_state(coordinator, txn, "PREPARE_START");
-    
     log_message_json("INFO", "txn_coordinator", txn_id, "Starting PREPARE phase", -1);
-    
+    pthread_mutex_unlock(&coordinator->mutex);
+
     bool all_prepared = true;
     for (size_t i = 0; i < txn->participant_count; i++) {
         Participant *p = &txn->participants[i];
@@ -231,17 +243,17 @@ int txn_commit(TransactionCoordinator *coordinator, Transaction *txn) {
             break;  // Fail fast
         }
     }
-    
+    pthread_mutex_lock(&coordinator->mutex);
     if (all_prepared) {
         txn->state = TXN_PREPARED;
         log_transaction_state(coordinator, txn, "PREPARED");
         
-        // Phase 2: COMMIT
+        // Phase 2: COMMIT (mark under lock, then release lock for I/O)
         txn->state = TXN_COMMITTING;
         log_transaction_state(coordinator, txn, "COMMIT_START");
-        
         log_message_json("INFO", "txn_coordinator", txn_id, "Starting COMMIT phase", -1);
-        
+        pthread_mutex_unlock(&coordinator->mutex);
+
         bool commit_success = true;
         for (size_t i = 0; i < txn->participant_count; i++) {
             Participant *p = &txn->participants[i];
@@ -259,24 +271,24 @@ int txn_commit(TransactionCoordinator *coordinator, Transaction *txn) {
                 }
             }
         }
-        
+        pthread_mutex_lock(&coordinator->mutex);
         if (commit_success) {
             txn->state = TXN_COMMITTED;
             log_transaction_state(coordinator, txn, "COMMITTED");
             log_message_json("INFO", "txn_coordinator", txn_id, "Transaction committed successfully", -1);
             
             remove_transaction(coordinator, txn_id);
+            metrics_inc_2pc_committed();
             pthread_mutex_unlock(&coordinator->mutex);
             return 0;
         }
     }
-    
     // ABORT path
     txn->state = TXN_ABORTING;
     log_transaction_state(coordinator, txn, "ABORT_START");
-    
     log_message_json("WARN", "txn_coordinator", txn_id, "Aborting transaction", -1);
-    
+    pthread_mutex_unlock(&coordinator->mutex);
+
     for (size_t i = 0; i < txn->participant_count; i++) {
         Participant *p = &txn->participants[i];
         
@@ -286,13 +298,13 @@ int txn_commit(TransactionCoordinator *coordinator, Transaction *txn) {
             log_message_json("INFO", "txn_coordinator", txn_id, "Participant aborted", -1);
         }
     }
-    
+    pthread_mutex_lock(&coordinator->mutex);
     txn->state = TXN_ABORTED;
     log_transaction_state(coordinator, txn, "ABORTED");
-    
     remove_transaction(coordinator, txn_id);
+    metrics_inc_2pc_aborted();
     pthread_mutex_unlock(&coordinator->mutex);
-    
+
     log_message_json("INFO", "txn_coordinator", txn_id, "Transaction aborted", -1);
     return -1;
 }

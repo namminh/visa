@@ -5,7 +5,7 @@ Tài liệu này giúp bạn đọc hiểu code như một senior engineer - kh�
 
 ---
 
-# 🧭 **CHIẾN LƯỢC ĐỌC CODE CHUYEN SÂU**
+# 🧭 **CHIẾN LƯỢC ĐỌC CODE CHUYÊN SÂU**
 
 ## **📖 Nguyên tắc 3-Layer Reading:**
 1. **Bird's Eye View** - Architecture & Flow
@@ -15,6 +15,19 @@ Tài liệu này giúp bạn đọc hiểu code như một senior engineer - kh�
 ---
 
 # 🏗️ **LAYER 1: ARCHITECTURE OVERVIEW**
+
+## 📂 Source Map Nhanh (Server)
+- `server/main.c`: Entry – init config/log/db/threadpool/network + reversal worker
+- `server/net.c`: TCP accept → submit `handler_job`
+- `server/handler.c`: Đọc 1 dòng JSON, validate, risk, 2PC, phản hồi, `/healthz|/readyz|/metrics|/version`
+- `server/iso8583.{c,h}`: Parser JSON đơn giản thành `IsoRequest`
+- `server/db.{c,h}`: Kết nối PG, insert/idempotent insert, TLS per-thread
+- `server/db_participant.{c,h}`: Participant 2PC cho Postgres (BEGIN → PREPARE/COMMIT PREPARED)
+- `server/clearing_participant.{c,h}`: Participant 2PC mô phỏng clearing + retry + circuit breaker
+- `server/transaction_coordinator.{c,h}`: State machine 2PC, log WAL đơn giản
+- `server/threadpool.{c,h}`: Hàng đợi bounded + worker threads
+- `server/metrics.{c,h}`: Counters in-memory, phục vụ `/metrics`
+- `server/reversal.{c,h}`: Worker gửi reversal/void khi outcome không chắc chắn
 
 ## **🎯 System Design Questions:**
 
@@ -43,6 +56,19 @@ Thread-per-Connection:
 ```
 
 **🧠 Senior Insight**: Thread pool là choice tốt cho high-concurrency, short-lived requests. Payment processing thường < 100ms/request.
+
+### Q3: Luồng xử lý 1 request (End-to-end)
+1. Net: `accept()` → tạo `HandlerContext` → `threadpool_submit()` (net.c)
+2. Handler: đọc 1 dòng JSON, parse `IsoRequest` → Luhn + amount + risk (handler.c)
+3. Tạo `txn_id`, init `TransactionCoordinator` (TLS) (handler.c)
+4. Tạo `DBParticipantContext` + `ClearingParticipantContext` và `txn_register_participant`
+5. DB: `BEGIN` → insert/idempotent (db_participant.c + db.c)
+6. Clearing: set transaction (pan_masked, amount, merchant)
+7. 2PC: `txn_commit()` → PREPARE all → COMMIT all (transaction_coordinator.c)
+8. Thành công: trả `APPROVED`; Thất bại: trả `DECLINED` + enqueue reversal (reversal.c)
+9. Metrics/log: cập nhật counters, log JSON 1 dòng
+
+Mẹo debug nhanh: grep theo `txn_id` trong logs/transactions.log và stderr để lần theo phases.
 
 ### **Q2: Tại sao dùng Bounded Queue thay vì Unbounded?**
 
@@ -227,6 +253,52 @@ listen(listen_fd, 128);
 
 **💡 Listen Backlog = 128:**
 - **Purpose**: Queue for pending connections
+
+---
+
+# 🔗 Endpoint Mới (bổ sung)
+
+- GET `/tx?request_id=...` — tra cứu nhanh giao dịch theo `request_id`.
+  - Response khi tìm thấy: `{"request_id":"...","amount":"...","status":"..."}`
+  - Khi không có: `{"status":"NOT_FOUND"}`
+  - Ví dụ nhanh:
+    - `printf 'GET /tx?request_id=abc123\r\n' | nc 127.0.0.1 9090`
+  - Ghi chú: parsing query trong handler là tối giản (demo). Nếu mở rộng query string, nên tách parser chuẩn.
+
+---
+
+# 🩺 Observability Playbook (thực chiến)
+
+**Health/Ready**
+- `printf 'GET /healthz\r\n' | nc 127.0.0.1 9090` → OK khi process sống.
+- `printf 'GET /readyz\r\n'  | nc 127.0.0.1 9090` → phụ thuộc DB `CONNECTION_OK`.
+
+**Metrics Snapshot**
+- `printf 'GET /metrics\r\n' | nc 127.0.0.1 9090`
+- Ý nghĩa chính:
+  - `total/approved/declined/server_busy` → throughput, tỉ lệ lỗi, backpressure.
+  - `twopc_committed/aborted` → sức khỏe 2PC.
+  - `clearing_cb_short_circuit` → circuit breaker có mở không.
+  - `reversal_enqueued/succeeded/failed` → tính nhất quán bù (sau lỗi commit).
+
+**Log Tracing (stderr JSON 1 dòng / file `server.err`)**
+- Theo `request_id`: `grep '"request_id":"abc123"' server.err`
+- Theo `txn_id`: `grep '"txn_id":"visa_abc' -n server.err`
+- Lọc lỗi: `grep '"lvl":"ERROR"' server.err`
+- Quan sát latency: `grep '"event":"tx"' server.err | awk -F'"latency_us":' '{print $2}' | cut -d',' -f1 | head`
+
+**DB Quick Checks (psql)**
+- Đếm nhanh: `SELECT status, COUNT(*) FROM transactions GROUP BY 1 ORDER BY 2 DESC;`
+- Tra cứu theo `request_id`: `SELECT request_id, amount, status FROM transactions WHERE request_id = 'abc123';`
+- Theo thời gian: `SELECT date_trunc('minute', created_at) AS m, COUNT(*) FROM transactions GROUP BY 1 ORDER BY 1 DESC LIMIT 30;`
+
+**Loadgen sanity**
+- `./build/loadgen 50 200 9090` → tăng dần, theo dõi khi `server_busy` bắt đầu tăng.
+- Tune nhanh: `THREADS=8 QUEUE_CAP=2048 ./build/server` (tham số qua ENV).
+
+**Lưu ý bảo mật/đầu vào**
+- Newline framing + buffer 8K giúp tránh DoS đơn giản; nếu mở rộng payload, cân nhắc dùng JSON lib chuẩn.
+- Không log PAN thô: chỉ mask 6+4; kiểm tra lại mọi điểm log để tránh rò rỉ.
 - **Tuning**: Balance memory vs burst capacity
 - **Calculation**: Should be > max_concurrent_accepts
 - **OS Limit**: Limited by `/proc/sys/net/core/somaxconn`
@@ -306,6 +378,115 @@ for (;;) {
 ---
 
 # 🔬 **LAYER 3: X-RAY VIEW - HIDDEN COMPLEXITIES**
+
+## ⚙️ 2PC State Machine – Khía cạnh concurrency (smart upgrade)
+
+File: `server/transaction_coordinator.c`
+- Đặt state dưới lock, nhưng THỰC HIỆN I/O ngoài lock để tránh giữ mutex lâu:
+  - PREPARE: set `TXN_PREPARING` + log → unlock → gọi `p->prepare()` tuần tự → lock lại để set `TXN_PREPARED`
+  - COMMIT: set `TXN_COMMITTING` + log → unlock → gọi `p->commit()` → lock lại finalize
+- Abort path: set `TXN_ABORTING` + log → unlock → gọi `p->abort()` → lock lại set `TXN_ABORTED`
+- Timeouts (env): `TWOPC_PREPARE_TIMEOUT`, `TWOPC_COMMIT_TIMEOUT` lưu trong transaction, sẵn sàng để enforce.
+
+Điểm đọc nhanh:
+- Bắt đầu PREPARE: khoảng dòng 206–216
+- Vòng prepare participants: ~217–233
+- Đặt `TXN_PREPARED/COMMITTING`: ~235–245
+- COMMIT participants và finalize: ~245–270
+- ABORT path: ~274–297
+
+## 🌐 Clearing Participant – Retry + Circuit Breaker
+
+File: `server/clearing_participant.c`
+- `simulate_clearing_request()`: mô phỏng HTTP; có delay/ngẫu nhiên lỗi.
+- Circuit breaker toàn tiến trình:
+  - Env: `CLEARING_CB_WINDOW` (mặc định 30s), `CLEARING_CB_FAILS` (5), `CLEARING_CB_OPEN_SECS` (20s)
+  - Khi mở: short‑circuit `prepare/commit` (đếm metrics `clearing_cb_short_circuit`)
+- Retry: `CLEARING_RETRY_MAX` (mặc định 2) với backoff 100ms, 200ms, 400ms…
+- Timeout: `CLEARING_TIMEOUT` (mặc định 30s)
+- Abort idempotent: ngay cả khi không thấy hold cục bộ vẫn gửi abort (best‑effort release).
+
+Điểm đọc nhanh:
+- Cấu trúc `CircuitBreaker g_cb`: phần đầu file
+- Check mở breaker: `cb_should_short_circuit()`
+- PREPARE/COMMIT dùng retry + breaker: trong các hàm `clearing_participant_prepare/commit`
+
+## 🗄️ DB Participant – Prepared Transactions
+
+File: `server/db_participant.c`
+- `db_participant_begin()` → `BEGIN`
+- `db_participant_prepare()` → `PREPARE TRANSACTION 'visa_<txn_id>'`
+- `db_participant_commit()` → `COMMIT PREPARED 'visa_<txn_id>'`
+- `db_participant_abort()` → `ROLLBACK` nếu chưa prepare, hoặc `ROLLBACK PREPARED` nếu đã prepare.
+- Idempotent insert: `db_insert_or_get_by_reqid()` trong `db.c`: ON CONFLICT(request_id) DO NOTHING → SELECT status.
+
+## 🔁 Reversal Worker – Unknown Outcome Handler
+
+Files: `server/reversal.{c,h}`, tích hợp ở `main.c` và `handler.c`
+- Khi `txn_commit()` thất bại, handler enqueue reversal: `reversal_enqueue(txn_id, pan_masked, amount, merchant)`
+- Worker nền: lấy task theo `next_at`, gửi `clearing_participant_abort()` best‑effort.
+- Retry exponential backoff: `REVERSAL_BASE_DELAY_MS` (mặc định 250ms) × 2^attempt, tối đa `REVERSAL_MAX_ATTEMPTS` (mặc định 6).
+- Metrics: `reversal_enqueued|reversal_succeeded|reversal_failed`.
+
+Điểm đọc nhanh:
+- Enqueue trong `handler.c` ngay sau `commit_failed`
+- Vòng worker trong `reversal.c`: hàm `reversal_loop()`
+
+## 📊 Metrics & Endpoints
+
+Handler phục vụ các endpoint đơn giản per-line:
+- `GET /healthz` → `OK`
+- `GET /readyz` → kiểm tra PG sẵn sàng (`db_is_ready`)
+- `GET /version` → từ `version.h`
+- `GET /metrics` → JSON counters:
+  - Cơ bản: `total, approved, declined, server_busy, risk_declined`
+  - 2PC: `twopc_committed, twopc_aborted`
+  - Clearing: `clearing_cb_short_circuit`
+  - Reversal: `reversal_enqueued, reversal_succeeded, reversal_failed`
+
+Files: `server/handler.c`, `server/metrics.{c,h}`
+
+## 📈 Sequence Diagrams (ASCII)
+
+2PC End‑to‑End
+```
+Client        Handler           Coordinator         DB Participant        Clearing
+  |   JSON       |                    |                    |                   |
+  |------------->|                    |                    |                   |
+  |              | parse/validate     |                    |                   |
+  |              | begin txn_id       |                    |                   |
+  |              |------------------->| TXN_PREPARING      |                   |
+  |              |                    | prepare(db)        |                   |
+  |              |                    |------------------->| BEGIN, PREPARE    |
+  |              |                    | prepare(clearing)  |                   |
+  |              |                    |------------------------------->| hold   |
+  |              |                    | TXN_PREPARED       |                   |
+  |              |                    | TXN_COMMITTING     |                   |
+  |              |                    | commit(db)         |                   |
+  |              |                    |------------------->| COMMIT PREPARED   |
+  |              |                    | commit(clearing)   |                   |
+  |              |                    |------------------------------->| settle |
+  |              |                    | TXN_COMMITTED      |                   |
+  |  APPROVED    |                    |                    |                   |
+  |<-------------|                    |                    |                   |
+```
+
+Reversal Worker (Unknown Outcome)
+```
+Handler            ReversalQueue       ReversalWorker          Clearing
+  | enqueue fail      |                     |                    |
+  |------------------>| (task: txn_id,amt) |                    |
+  |                   |                     | dequeue/backoff   |
+  |                   |                     |------------------>| abort/void
+  |                   |                     | <----- OK/ERR ----|
+  |                   |                     | retry or done     |
+```
+
+## ⚙️ Env Config Tổng Hợp (phần liên quan nâng cấp “smart”)
+- 2PC: `TWOPC_PREPARE_TIMEOUT`, `TWOPC_COMMIT_TIMEOUT`
+- Clearing: `CLEARING_TIMEOUT`, `CLEARING_RETRY_MAX`, `CLEARING_CB_WINDOW`, `CLEARING_CB_FAILS`, `CLEARING_CB_OPEN_SECS`
+- Reversal: `REVERSAL_MAX_ATTEMPTS`, `REVERSAL_BASE_DELAY_MS`
+- Core: `DB_URI`, `PORT`, `THREADS`/`NUM_THREADS`, `QUEUE_CAP`
 
 ## **🕳️ Edge Cases & Subtle Bugs**
 
@@ -452,6 +633,7 @@ Persistent Metrics:
 
 ## **⚡ Performance Hotspots:**
 - [ ] **Critical Section Size**: Mutex held time minimized?
+- [ ] **Coordinator I/O Outside Lock**: PREPARE/COMMIT/ABORT gọi ngoài global lock?
 - [ ] **Memory Allocation**: Có malloc/free trong hot path không?
 - [ ] **System Calls**: Syscall frequency optimized?
 - [ ] **Buffer Sizes**: Buffer size phù hợp với workload?
@@ -461,12 +643,14 @@ Persistent Metrics:
 - [ ] **Exception Safety**: Cleanup paths được test?
 - [ ] **Partial Failures**: System handle được partial operations?
 - [ ] **Error Propagation**: Lỗi được propagate đúng cách?
+- [ ] **Unknown Outcome**: Có enqueue reversal/advice khi không chắc kết quả?
 
 ## **📈 Scalability Limits:**
 - [ ] **Resource Bounds**: Fixed limits documented và tunable?
 - [ ] **Memory Growth**: Memory usage bounded?
 - [ ] **File Descriptors**: FD leaks prevented?
 - [ ] **Thread Limits**: Thread pool size configurable?
+- [ ] **Breaker Tunables**: Env cho circuit breaker/retry/timeout rõ ràng?
 
 ---
 
@@ -563,3 +747,10 @@ Bottleneck: Network latency
 **🎯 Kết luận**: Code này demonstrate solid understanding của concurrent system design. Production deployment cần thêm observability, security, và configuration management, nhưng core architecture rất sound.
 
 **📖 Reading Time**: ~2-3 giờ để đọc thoroughly, 30 phút để review nhanh.
+1) Không giữ global lock khi làm I/O mạng/DB trong 2PC → throughput cao hơn, giảm contention.
+2) Circuit breaker + retry + timeout cho external dependency → tránh “dogpile effect”.
+3) Reversal worker cho outcome không chắc chắn → đảm bảo tính nhất quán nghiệp vụ.
+4) Idempotency thực tế (request_id) ở DB → chống double-charge.
+5) Endpoint health/ready/metrics đơn giản giúp vận hành quan sát nhanh.
+
+Mẹo phỏng vấn: chỉ vào các anchor trong code (`[ANCHOR:...]` ở handler/net/threadpool), giải thích vì sao execute outside lock, và đưa ra chiến lược recovery+observability.

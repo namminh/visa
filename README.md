@@ -76,13 +76,17 @@ export THREADS=8 QUEUE_CAP=2048
 * Idempotency: if a `request_id` field is provided, the server inserts once and returns the existing result on retries.
 * Keep-alive + framing: the server reads newline-delimited JSON and can handle multiple requests per TCP connection until timeout/close.
 * Structured logging: one JSON line per request on stderr with fields `ts,lvl,event,request_id,status,latency_us`.
-* Metrics: simple counters (`total, approved, declined, server_busy`) and a `GET /metrics` snapshot.
+* Metrics: simple counters snapshot via `GET /metrics`.
+  - Core: `total, approved, declined, server_busy, risk_declined`
+  - 2PC/Clearing/Reversal (smart): `twopc_committed, twopc_aborted, clearing_cb_short_circuit, reversal_enqueued, reversal_succeeded, reversal_failed`
 * Use Valgrind and GDB to check for memory leaks and concurrency issues.
 * Always test with increasing load to observe behaviour under stress.
 * Logs write to stderr with timestamps; you can tail errors with `scripts/tail-errs.sh server.err`.
 
 ## Additional Docs
 
+- Quick tour (VN): `CODE_READING_QUICK.md`
+- Code reading chuyên sâu (VN): `CODE_READING_CHUYEN_SAU.md`
 - Vietnamese quick start: `HUONGDAN.md`
 - Vietnamese scenario-based test guide: `TEST_HUONGDAN.md`
 - PostgreSQL permissions guide: `DB_PERMISSIONS.md`
@@ -93,3 +97,9 @@ export THREADS=8 QUEUE_CAP=2048
 - Interview notes (Vietnamese): `PHONGVAN_NOTES.md`
 - Full interview handbook (Vietnamese): `PHONGVAN_FULL.md`
  - Visual, easy-to-learn handbook (VN): `PHONGVAN_VISUAL.md`
+ - Ops runbook (VN): `RUNBOOK_PAYMENTS.md`
+
+## Smart runtime env (optional)
+- 2PC timeouts: `TWOPC_PREPARE_TIMEOUT`, `TWOPC_COMMIT_TIMEOUT` (seconds)
+- Clearing: `CLEARING_TIMEOUT`, `CLEARING_RETRY_MAX`, `CLEARING_CB_WINDOW`, `CLEARING_CB_FAILS`, `CLEARING_CB_OPEN_SECS`
+- Reversal worker: `REVERSAL_MAX_ATTEMPTS`, `REVERSAL_BASE_DELAY_MS`
