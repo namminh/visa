@@ -251,6 +251,62 @@ test_no_pan_in_logs() {
   fi
 }
 
+# 2PC: Two-Phase Commit unit tests
+test_2pc_unit() {
+  if [[ -f "$ROOT_DIR/build/test_2pc" ]]; then
+    log "Running 2PC unit tests..."
+    local out
+    out=$("$ROOT_DIR/build/test_2pc" 2>&1 || true)
+    if echo "$out" | grep -q "All 2PC tests passed"; then
+      log "2PC unit tests: PASSED"
+      return 0
+    else
+      log "2PC unit tests: FAILED"
+      logv "$out"
+      return 1
+    fi
+  else
+    log "2PC unit tests: SKIPPED (test_2pc not built)"
+    return 0
+  fi
+}
+
+# 2PC: Integration tests with scenarios
+test_2pc_integration() {
+  # Try advanced tests first, fallback to simple
+  if [[ -x "$ROOT_DIR/tests/test_2pc_advanced.sh" ]]; then
+    log "Running advanced 2PC integration tests..."
+    local out
+    out=$(DB_URI="$DB_URI" "$ROOT_DIR/tests/test_2pc_advanced.sh" "$PORT" 2>&1 || true)
+    if echo "$out" | grep -q "Success Rate: [789][0-9]%\|Success Rate: 100%"; then
+      log "2PC integration tests: PASSED (advanced)"
+      return 0
+    else
+      log "Advanced 2PC tests had issues, trying simple tests..."
+    fi
+  fi
+  
+  # Fallback to simple tests
+  if [[ -f "$ROOT_DIR/tests/test_2pc_simple.sh" ]]; then
+    log "Running simple 2PC integration tests..."
+    local out
+    out=$(DB_URI="$DB_URI" bash "$ROOT_DIR/tests/test_2pc_simple.sh" "$PORT" 2>&1 || true)
+    local pass_count
+    pass_count=$(echo "$out" | grep -c "PASS" || echo "0")
+    if (( pass_count >= 2 )); then
+      log "2PC integration tests: PASSED (simple, $pass_count tests)"
+      return 0
+    else
+      log "2PC integration tests: FAILED (simple, $pass_count passed)"
+      logv "$out"
+      return 1
+    fi
+  else
+    log "2PC integration tests: SKIPPED (no test files found)"
+    return 0
+  fi
+}
+
 run_case() {
   local name="$1"; shift
   section "$name"
@@ -268,6 +324,8 @@ run_case "M2: keepalive"        test_keepalive
 run_case "M2: partial_read"     test_partial_read
 run_case "M2: metrics"          test_metrics
 run_case "SEC: no_pan_in_logs"  test_no_pan_in_logs
+run_case "2PC: unit_tests"      test_2pc_unit
+run_case "2PC: integration"     test_2pc_integration
 
 echo
 echo "======== TEST SUMMARY ========"

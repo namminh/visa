@@ -1,0 +1,311 @@
+version: '3.8'
+
+services:
+  # Database Services
+  postgres-payments:
+    image: postgres:15-alpine
+    container_name: postgres-payments
+    environment:
+      POSTGRES_DB: payments_db
+      POSTGRES_USER: payment_user
+      POSTGRES_PASSWORD: payment_pass
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+    volumes:
+      - postgres_payments_data:/var/lib/postgresql/data
+      - ./sql/payments-schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - mini-visa-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payment_user -d payments_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres-risk:
+    image: postgres:15-alpine
+    container_name: postgres-risk
+    environment:
+      POSTGRES_DB: risk_db
+      POSTGRES_USER: risk_user
+      POSTGRES_PASSWORD: risk_pass
+    volumes:
+      - postgres_risk_data:/var/lib/postgresql/data
+      - ./sql/risk-schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    ports:
+      - "5433:5432"
+    networks:
+      - mini-visa-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U risk_user -d risk_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres-clearing:
+    image: postgres:15-alpine
+    container_name: postgres-clearing
+    environment:
+      POSTGRES_DB: clearing_db
+      POSTGRES_USER: clearing_user
+      POSTGRES_PASSWORD: clearing_pass
+    volumes:
+      - postgres_clearing_data:/var/lib/postgresql/data
+      - ./sql/clearing-schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    ports:
+      - "5434:5432"
+    networks:
+      - mini-visa-network
+    restart: unless-stopped
+
+  postgres-ledger:
+    image: postgres:15-alpine
+    container_name: postgres-ledger
+    environment:
+      POSTGRES_DB: ledger_db
+      POSTGRES_USER: ledger_user
+      POSTGRES_PASSWORD: ledger_pass
+    volumes:
+      - postgres_ledger_data:/var/lib/postgresql/data
+      - ./sql/ledger-schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    ports:
+      - "5435:5432"
+    networks:
+      - mini-visa-network
+    restart: unless-stopped
+
+  # Redis for event streaming
+  redis:
+    image: redis:7-alpine
+    container_name: redis-events
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - mini-visa-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # Core Microservices
+  payment-service:
+    build:
+      context: ./payment-service
+      dockerfile: Dockerfile
+    container_name: payment-service
+    environment:
+      - PORT=8080
+      - RISK_SERVICE_URL=http://risk-service:8081
+      - CLEARING_SERVICE_URL=http://clearing-service:8082
+      - LEDGER_SERVICE_URL=http://ledger-service:8083
+      - DB_URI=postgresql://payment_user:payment_pass@postgres-payments:5432/payments_db
+      - MAX_THREADS=10
+      - QUEUE_CAPACITY=1000
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres-payments:
+        condition: service_healthy
+      risk-service:
+        condition: service_started
+      clearing-service:
+        condition: service_started
+    networks:
+      - mini-visa-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  risk-service:
+    build:
+      context: ./risk-service
+      dockerfile: Dockerfile
+    container_name: risk-service
+    environment:
+      - PORT=8081
+      - RISK_MAX_AMOUNT=10000
+      - RISK_VELOCITY_LIMIT=20
+      - RISK_VELOCITY_WINDOW=60
+      - DB_URI=postgresql://risk_user:risk_pass@postgres-risk:5432/risk_db
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres-risk:
+        condition: service_healthy
+    networks:
+      - mini-visa-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "8081"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  clearing-service:
+    build:
+      context: ./clearing-service
+      dockerfile: Dockerfile
+    container_name: clearing-service
+    environment:
+      - PORT=8082
+      - CLEARING_SIMULATE_FAILURES=5
+      - CLEARING_PREPARE_TIMEOUT=30
+      - CLEARING_COMMIT_TIMEOUT=30
+      - DB_URI=postgresql://clearing_user:clearing_pass@postgres-clearing:5432/clearing_db
+    ports:
+      - "8082:8082"
+    depends_on:
+      postgres-clearing:
+        condition: service_started
+    networks:
+      - mini-visa-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "8082"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  ledger-service:
+    build:
+      context: ./ledger-service
+      dockerfile: Dockerfile
+    container_name: ledger-service
+    environment:
+      - PORT=8083
+      - DB_URI=postgresql://ledger_user:ledger_pass@postgres-ledger:5432/ledger_db
+      - REDIS_URL=redis://redis:6379
+    ports:
+      - "8083:8083"
+    depends_on:
+      postgres-ledger:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    networks:
+      - mini-visa-network
+    restart: unless-stopped
+
+  reversal-service:
+    build:
+      context: ./reversal-service
+      dockerfile: Dockerfile
+    container_name: reversal-service
+    environment:
+      - PORT=8084
+      - REDIS_URL=redis://redis:6379
+      - CLEARING_SERVICE_URL=http://clearing-service:8082
+      - MAX_RETRY_ATTEMPTS=3
+      - RETRY_DELAY_MS=1000
+    ports:
+      - "8084:8084"
+    depends_on:
+      - redis
+      - clearing-service
+    networks:
+      - mini-visa-network
+    restart: unless-stopped
+
+  query-service:
+    build:
+      context: ./query-service
+      dockerfile: Dockerfile
+    container_name: query-service
+    environment:
+      - PORT=8085
+      - DB_URI=postgresql://payment_user:payment_pass@postgres-payments:5432/payments_db
+      - REDIS_URL=redis://redis:6379
+    ports:
+      - "8085:8085"
+    depends_on:
+      - postgres-payments
+      - redis
+    networks:
+      - mini-visa-network
+    restart: unless-stopped
+
+  # API Gateway
+  nginx-gateway:
+    image: nginx:alpine
+    container_name: api-gateway
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/api-gateway.conf:/etc/nginx/conf.d/default.conf
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - payment-service
+      - risk-service
+      - clearing-service
+      - ledger-service
+      - reversal-service
+      - query-service
+    networks:
+      - mini-visa-network
+    restart: unless-stopped
+
+  # Monitoring Services
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - mini-visa-network
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - mini-visa-network
+    restart: unless-stopped
+
+volumes:
+  postgres_payments_data:
+  postgres_risk_data:
+  postgres_clearing_data:
+  postgres_ledger_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  mini-visa-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

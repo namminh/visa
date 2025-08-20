@@ -1,0 +1,82 @@
+# Kustomization file for mini-visa payment system
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Metadata
+metadata:
+  name: mini-visa-deployment
+  annotations:
+    description: "Complete Kubernetes deployment for mini-visa payment system"
+
+# Namespace
+namespace: mini-visa
+
+# Resources in order of dependency
+resources:
+- namespace.yaml
+- rbac/service-accounts.yaml
+- configmaps/payment-service-config.yaml
+- secrets/database-secrets.yaml
+- databases/postgres-payment.yaml
+- redis/redis-cluster.yaml
+- deployments/payment-service.yaml
+- services/payment-service-svc.yaml
+- hpa/payment-service-hpa.yaml
+- monitoring/prometheus-config.yaml
+- istio/gateway.yaml
+
+# Common labels applied to all resources
+commonLabels:
+  app.kubernetes.io/name: mini-visa
+  app.kubernetes.io/instance: production
+  app.kubernetes.io/version: v1.0.0
+  app.kubernetes.io/component: payment-system
+  app.kubernetes.io/part-of: fintech-platform
+  app.kubernetes.io/managed-by: kustomize
+
+# Common annotations
+commonAnnotations:
+  deployment.kubernetes.io/revision: "1"
+  kubernetes.io/change-cause: "Initial deployment of mini-visa payment system"
+
+# Images (to be overridden per environment)
+images:
+- name: mini-visa/payment-service
+  newTag: v1.0.0
+- name: postgres
+  newTag: 15-alpine
+- name: redis
+  newTag: 7-alpine
+
+# Resource transformers
+patches:
+- target:
+    kind: Deployment
+    name: payment-service
+  patch: |-
+    - op: replace
+      path: /spec/replicas
+      value: 3
+
+# ConfigMap generators for environment-specific configs
+configMapGenerator:
+- name: environment-config
+  literals:
+  - ENVIRONMENT=production
+  - LOG_LEVEL=INFO
+  - DEBUG=false
+
+# Secret generators (use with sealed-secrets or external-secrets in production)
+secretGenerator:
+- name: api-keys
+  literals:
+  - INTERNAL_API_KEY=change-me-in-production
+
+# Replica counts for different environments
+replicas:
+- name: payment-service
+  count: 3
+- name: postgres-payment
+  count: 1
+- name: redis-cluster
+  count: 3
