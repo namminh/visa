@@ -1,0 +1,114 @@
+---
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: mini-visa-gateway
+  namespace: mini-visa
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+  - port:
+      number: 80
+      name: http
+      protocol: HTTP
+    hosts:
+    - "payments.mini-visa.local"
+    - "api.mini-visa.local"
+  - port:
+      number: 443
+      name: https
+      protocol: HTTPS
+    tls:
+      mode: SIMPLE
+      credentialName: mini-visa-tls
+    hosts:
+    - "payments.mini-visa.local"
+    - "api.mini-visa.local"
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: mini-visa-vs
+  namespace: mini-visa
+spec:
+  hosts:
+  - "payments.mini-visa.local"
+  - "api.mini-visa.local"
+  gateways:
+  - mini-visa-gateway
+  http:
+  - match:
+    - uri:
+        prefix: "/payments"
+    route:
+    - destination:
+        host: payment-service
+        port:
+          number: 8080
+    fault:
+      delay:
+        percentage:
+          value: 0.1
+        fixedDelay: 5s
+    retries:
+      attempts: 3
+      perTryTimeout: 3s
+      retryOn: gateway-error,connect-failure,refused-stream
+  - match:
+    - uri:
+        prefix: "/health"
+    route:
+    - destination:
+        host: payment-service
+        port:
+          number: 8080
+  - match:
+    - uri:
+        prefix: "/metrics"
+    route:
+    - destination:
+        host: payment-service
+        port:
+          number: 8080
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: payment-service-dr
+  namespace: mini-visa
+spec:
+  host: payment-service
+  trafficPolicy:
+    loadBalancer:
+      simple: LEAST_CONN
+    connectionPool:
+      tcp:
+        maxConnections: 100
+        connectTimeout: 30s
+        tcpKeepalive:
+          time: 7200s
+          interval: 75s
+      http:
+        http1MaxPendingRequests: 50
+        http2MaxRequests: 100
+        maxRequestsPerConnection: 10
+        maxRetries: 3
+        consecutiveGatewayErrors: 5
+        interval: 30s
+        baseEjectionTime: 30s
+        maxEjectionPercent: 50
+    outlierDetection:
+      consecutiveGatewayErrors: 5
+      consecutive5xxErrors: 5
+      interval: 30s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+      minHealthPercent: 50
+  subsets:
+  - name: v1
+    labels:
+      version: v1.0.0
+  - name: canary
+    labels:
+      version: canary

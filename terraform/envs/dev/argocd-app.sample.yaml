@@ -1,0 +1,23 @@
+# Sample ArgoCD Application to sync this repo's k8s/ manifests
+# Replace <YOUR_GIT_REPO_URL> with your repo URL
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: mini-visa
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: <YOUR_GIT_REPO_URL>
+    path: k8s
+    targetRevision: HEAD
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: mini-visa
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true
+

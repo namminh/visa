@@ -17,7 +17,8 @@
       "Bash(./build/server)",
       "Bash(./build/test_2pc_simple)",
       "Bash(./build/test_clearing)",
-      "Bash(./build/test_stress)"
+      "Bash(./build/test_stress)",
+      "WebSearch"
     ],
     "deny": [],
     "defaultMode": "acceptEdits"

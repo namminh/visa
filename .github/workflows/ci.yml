@@ -44,7 +44,7 @@ jobs:
             -e DB_URI="$DB_URI" -e PORT="$PORT" \
             -v "${GITHUB_WORKSPACE}:/work" -w /work \
             mini-visa-ci:${GITHUB_SHA} \
-            bash -lc './tests/run_all.sh'
+            bash -lc 'bash ./tests/run_all.sh'
 
       - name: Upload artifacts (logs and binaries)
         if: always()
