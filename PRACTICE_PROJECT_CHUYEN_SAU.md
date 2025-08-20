@@ -244,7 +244,7 @@ Mục tiêu: nâng cấp mini‑Visa thành dịch vụ có khả năng chịu l
 
 ### 16.6 Migrations không downtime
 - Nguyên tắc Backward/Forward compatible: thêm cột → backfill → chạy dual‑read/dual‑write (nếu cần) → cắt cũ → xóa cột cũ.
-- Online index creation; chạy shadow reads để so sánh kết quả giữa lược đồ cũ/mới (sampling).
+- Online index creation; chạy shadow reads để so sánh kết quả giữa lư ợc đồ cũ/mới (sampling).
 - Triển khai blue/green hoặc canary theo phần trăm traffic; hỗ trợ `GET /version` và flag `schema_version` trong response để kiểm.
 
 ### 16.7 Bảo mật & tuân thủ mở rộng

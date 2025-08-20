@@ -15,5 +15,5 @@ if [[ -z "$PAYLOAD" ]]; then
 fi
 
 echo "Sending to 127.0.0.1:${PORT} -> ${PAYLOAD}"
-printf "%s" "$PAYLOAD" | nc 127.0.0.1 "$PORT"
-
+# The server expects newline-delimited JSON; ensure trailing newline is sent
+printf "%s\n" "$PAYLOAD" | nc 127.0.0.1 "$PORT"
